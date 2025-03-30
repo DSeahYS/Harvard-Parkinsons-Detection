@@ -1,8 +1,6 @@
 # GenomicGuard: Early Parkinson's Detection System
 ## Multi-modal diagnostic platform combining eye movement analysis and genomic sequencing for pre-symptomatic Parkinson's detection
 
-![Parkinson's detection concept](https://example.com/Example interface - placeholder image*
-
 # Table of Contents
 Key Innovations
 System Architecture
