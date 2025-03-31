@@ -9,10 +9,12 @@ class EyeTracker:
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
-            refine_landmarks=True,
+            refine_landmarks=True,  # Required for iris detection
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
+        print("Initialized EyeTracker with iris detection enabled")  # Debug print
+        self._log_count = 0  # Counter for logging frequency
         
         # Drawing utilities
         self.mp_drawing = mp.solutions.drawing_utils
@@ -41,14 +43,21 @@ class EyeTracker:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, _ = frame.shape
         
+        # Add tracking indicator text
+        cv2.putText(frame, "Eye Tracking Status", (20, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
         # Process the frame
         results = self.face_mesh.process(rgb_frame)
         
         metrics = {}
-        debug_frame = frame.copy()
         
         if results.multi_face_landmarks:
             face_landmarks = results.multi_face_landmarks[0]
+            
+            # Display "Eyes Detected" in green
+            cv2.putText(frame, "Eyes Detected", (20, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             # Extract eye landmarks
             left_eye = self._extract_eye_landmarks(face_landmarks, self.LEFT_EYE, w, h)
@@ -56,24 +65,37 @@ class EyeTracker:
             left_iris = self._extract_eye_landmarks(face_landmarks, self.LEFT_IRIS, w, h)
             right_iris = self._extract_eye_landmarks(face_landmarks, self.RIGHT_IRIS, w, h)
             
+            # Draw eye regions more prominently
+            for point in left_eye:
+                x, y = int(point[0]), int(point[1])
+                cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
+                
+            for point in right_eye:
+                x, y = int(point[0]), int(point[1])
+                cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
+            
+            # Highlight iris points with larger bright circles
+            for point in left_iris:
+                x, y = int(point[0]), int(point[1])
+                cv2.circle(frame, (x, y), 4, (255, 0, 0), -1)
+                
+            for point in right_iris:
+                x, y = int(point[0]), int(point[1])
+                cv2.circle(frame, (x, y), 4, (255, 0, 0), -1)
+            
             # Calculate eye metrics
             metrics = self._calculate_eye_metrics(left_eye, right_eye, left_iris, right_iris, current_timestamp)
             
-            # Enhanced debug visualization
-            cv2.putText(debug_frame, "Eyes Detected", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # Show active metrics on frame
+            if 'avg_saccade_velocity' in metrics:
+                vel = metrics['avg_saccade_velocity']
+                cv2.putText(frame, f"Saccade: {vel:.1f}°/s", (20, 90),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
-            # Draw eye contours
-            for idx in self.LEFT_EYE + self.RIGHT_EYE:
-                landmark = face_landmarks.landmark[idx]
-                x, y = int(landmark.x * w), int(landmark.y * h)
-                cv2.circle(debug_frame, (x, y), 2, (0, 255, 0), -1)
-            
-            # Highlight iris landmarks
-            for idx in self.LEFT_IRIS + self.RIGHT_IRIS:
-                landmark = face_landmarks.landmark[idx]
-                x, y = int(landmark.x * w), int(landmark.y * h)
-                cv2.circle(debug_frame, (x, y), 3, (255, 0, 0), -1)
+            if 'fixation_stability' in metrics:
+                stab = metrics['fixation_stability']
+                cv2.putText(frame, f"Fixation: {stab:.4f}", (20, 120),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
             # Draw landmarks on the frame for visualization
             self._draw_landmarks(frame, face_landmarks, w, h)
@@ -85,26 +107,28 @@ class EyeTracker:
             }
             self.prev_timestamp = current_timestamp
         else:
-            # No face detected - show troubleshooting tips
-            cv2.putText(debug_frame, "No Face Detected", (10, 30),
+            # Display "No eyes detected" in red
+            cv2.putText(frame, "No eyes detected", (20, 60),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
-            tips = [
-                "Ensure face is visible",
-                "Check lighting conditions",
-                "Remove glasses if possible",
-                "Move closer to camera"
-            ]
-            
-            y_pos = 60
+            # Add troubleshooting tips
+            tips = ["Check lighting", "Face the camera", "Remove obstacles"]
+            y_pos = 90
             for tip in tips:
-                cv2.putText(debug_frame, tip, (10, y_pos),
+                cv2.putText(frame, tip, (30, y_pos),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                y_pos += 25
+        # Log eye movements every 5 frames to avoid spamming console
+        self._log_count += 1
+        if self._log_count % 5 == 0:
+            self._log_eye_movements(metrics)
         
-        # Show debug window
-        cv2.imshow("Eye Tracking Debug", debug_frame)
-        cv2.waitKey(1)
+            y_pos += 30
+        
+        # Add FPS counter
+        if hasattr(self, 'prev_timestamp') and self.prev_timestamp:
+            fps = 1.0 / (current_timestamp - self.prev_timestamp)
+            cv2.putText(frame, f"FPS: {fps:.1f}", (w - 120, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         return frame, metrics
     
@@ -213,3 +237,18 @@ class EyeTracker:
             landmark = face_landmarks.landmark[idx]
             x, y = int(landmark.x * width), int(landmark.y * height)
             cv2.circle(frame, (x, y), 2, (255, 0, 0), -1)
+    def _log_eye_movements(self, metrics):
+        """Log eye movement metrics to console"""
+        if not metrics:
+            return
+            
+        movement_log = "Eye Tracking: "
+        if 'avg_saccade_velocity' in metrics:
+            movement_log += f"Saccade: {metrics['avg_saccade_velocity']:.2f}°/s | "
+        if 'fixation_stability' in metrics:
+            movement_log += f"Fixation: {metrics['fixation_stability']:.4f} | "
+        if 'avg_ear' in metrics:
+            movement_log += f"EAR: {metrics['avg_ear']:.3f}"
+            
+        print(movement_log)
+
