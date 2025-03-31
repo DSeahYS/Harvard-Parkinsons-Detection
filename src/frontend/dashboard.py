@@ -32,6 +32,11 @@ class Dashboard:
         self.btn_stop = ttk.Button(self.controls_frame, text="Stop", command=self.on_stop)
         self.btn_stop.pack(side=tk.LEFT, padx=5)
         
+        self.btn_debug = ttk.Button(self.controls_frame, text="Debug View",
+                                  command=self.toggle_debug)
+        self.btn_debug.pack(side=tk.LEFT, padx=5)
+        self.debug_mode = False
+        
         # Create metrics frame
         self.metrics_frame = ttk.LabelFrame(self.right_frame, text="Eye Metrics", padding=10)
         self.metrics_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -160,6 +165,20 @@ class Dashboard:
         """Run the dashboard"""
         self.window.mainloop()
     
+    def toggle_debug(self):
+        """Toggle debug visualization mode"""
+        self.debug_mode = not self.debug_mode
+        if self.debug_mode:
+            self.btn_debug.configure(text="Normal View")
+            print("Debug mode enabled")  # Debug print
+        else:
+            self.btn_debug.configure(text="Debug View")
+            print("Debug mode disabled")  # Debug print
+        
+        # Force immediate UI update
+        self.window.update_idletasks()
+        print(f"Debug mode state: {self.debug_mode}")  # Debug print
+
     def close(self):
         """Close the dashboard and release resources"""
         self.on_stop()
