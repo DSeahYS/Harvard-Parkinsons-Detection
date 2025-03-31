@@ -1,7 +1,9 @@
 import cv2
 import numpy as np
 import time
+import tkinter as tk
 from collections import deque
+from PIL import Image, ImageTk
 from src.models.eye_tracker import EyeTracker
 from src.models.pd_detector import ParkinsonsDetector
 from src.utils.visualization import create_metrics_visualization, create_risk_meter
@@ -26,7 +28,14 @@ def main():
             ret, frame = cap.read()
             if ret:
                 # Process frame with eye tracker
-                processed_frame, metrics = eye_tracker.process_frame(frame)
+                if dashboard.debug_mode:
+                    # Process with visualization on original frame
+                    processed_frame, metrics = eye_tracker.process_frame(frame)
+                else:
+                    # Process on copy to preserve original frame
+                    frame_copy = frame.copy()
+                    processed_frame, metrics = eye_tracker.process_frame(frame_copy)
+                    processed_frame = frame  # Keep original frame without indicators
                 print(f"Generated metrics: {metrics}")  # Debug output
                 
                 # Update metrics history
@@ -58,10 +67,16 @@ def main():
                 
                 # Convert frame to format suitable for tkinter
                 frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame_rgb)
+                img_tk = ImageTk.PhotoImage(image=img)
                 
-                # Display frame on dashboard
+                # Update canvas with proper reference keeping
                 dashboard.canvas.delete("all")
-                dashboard.canvas.create_image(0, 0, anchor="nw", image=cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB))
+                dashboard.canvas.create_image(0, 0, anchor=tk.NW, image=img_tk)
+                dashboard.canvas.image = img_tk  # Keep reference!
+                
+                # Force update
+                dashboard.window.update_idletasks()
             
             # Schedule next frame processing
             dashboard.window.after(33, process_webcam)  # ~30 FPS
