@@ -14,8 +14,8 @@ License
 # Key Innovations 🧠
 ## World's first web-based pre-symptomatic Parkinson's screening combining:
 
-MediaPipe Face Mesh for sub-millisecond eye tracking
-NVIDIA BioNeMo Evo-2 genomic analysis
+MediaPipe Face Mesh for sub-millisecond eye tracking (prototype to be 3d printed)
+NVIDIA BioNeMo Evo-2 genomic analysis (optional)
 Serverless architecture via Netlify Functions
 Real-time dashboard with WebGL genome visualization
 Detects neurological markers 5-7 years before motor symptoms appear with 94.2% specificity Clinical Trial Data
