@@ -1,18 +1,14 @@
 import numpy as np
 from collections import deque
+from src.data.thresholds import PD_THRESHOLDS # Import the thresholds
 
 class ParkinsonsDetector:
     def __init__(self, window_size=30):
         # Buffer for metrics history
         self.metrics_history = deque(maxlen=window_size)
         
-        # Clinical thresholds for Parkinson's detection
-        self.thresholds = {
-            'saccade_velocity': 400.0,  # deg/s, below this is concerning
-            'fixation_stability': 0.3,   # variance threshold
-            'blink_rate_min': 8,        # blinks per minute
-            'blink_rate_max': 21        # blinks per minute
-        }
+        # Clinical thresholds for Parkinson's detection - Load from imported dict
+        self.thresholds = PD_THRESHOLDS
     
     def analyze_metrics(self, metrics):
         """Analyze eye metrics for Parkinson's indicators"""
@@ -44,7 +40,13 @@ class ParkinsonsDetector:
                              if 'avg_saccade_velocity' in m]
         if saccade_velocities:
             features['avg_saccade_velocity'] = np.mean(saccade_velocities)
-        
+
+        # Extract vertical saccade velocities
+        vertical_saccade_velocities = [m.get('avg_vertical_saccade_velocity', 0) for m in self.metrics_history
+                                     if 'avg_vertical_saccade_velocity' in m]
+        if vertical_saccade_velocities:
+            features['avg_vertical_saccade_velocity'] = np.mean(vertical_saccade_velocities)
+
         # Extract fixation stability
         fixation_stabilities = [m.get('fixation_stability', 0) for m in self.metrics_history 
                                if 'fixation_stability' in m]
@@ -73,25 +75,43 @@ class ParkinsonsDetector:
         """Analyze features against clinical thresholds"""
         risk_factors = []
         risk_level = 0.0
-        
+        # Define weights for each factor (adjust as needed, ensuring they sum close to 1)
+        weights = {
+            'saccade': 0.30,
+            'vertical_saccade': 0.20,
+            'fixation': 0.25,
+            'blink': 0.25
+        }
+
+
         # Check saccade velocity (lower in Parkinson's)
         if 'avg_saccade_velocity' in features:
-            if features['avg_saccade_velocity'] < self.thresholds['saccade_velocity']:
-                risk_factors.append(f"Reduced saccade velocity: {features['avg_saccade_velocity']:.2f}°/s")
-                risk_level += 0.4  # Weight: 40%
+            # Use the specific threshold key from PD_THRESHOLDS
+            if features['avg_saccade_velocity'] < self.thresholds['saccade_velocity_min']:
+                risk_factors.append(f"Reduced saccade velocity: {features['avg_saccade_velocity']:.2f}°/s (Threshold: <{self.thresholds['saccade_velocity_min']})")
+                risk_level += weights['saccade']
+
+        # Check vertical saccade velocity (lower in Parkinson's)
+        if 'avg_vertical_saccade_velocity' in features:
+             # Use the specific threshold key from PD_THRESHOLDS
+            if features['avg_vertical_saccade_velocity'] < self.thresholds['vertical_saccade_velocity_min']:
+                risk_factors.append(f"Reduced vertical saccade velocity: {features['avg_vertical_saccade_velocity']:.2f}°/s (Threshold: <{self.thresholds['vertical_saccade_velocity_min']})")
+                risk_level += weights['vertical_saccade']
         
         # Check fixation stability (higher variance in Parkinson's)
         if 'avg_fixation_stability' in features:
+            # Use the specific threshold key from PD_THRESHOLDS
             if features['avg_fixation_stability'] > self.thresholds['fixation_stability']:
-                risk_factors.append(f"Reduced fixation stability: {features['avg_fixation_stability']:.4f}")
-                risk_level += 0.3  # Weight: 30%
+                risk_factors.append(f"Reduced fixation stability: {features['avg_fixation_stability']:.4f} (Threshold: >{self.thresholds['fixation_stability']})")
+                risk_level += weights['fixation']
         
         # Check blink rate (can be abnormal in Parkinson's)
         if 'blink_rate' in features:
-            if (features['blink_rate'] < self.thresholds['blink_rate_min'] or 
+            # Use the specific threshold keys from PD_THRESHOLDS
+            if (features['blink_rate'] < self.thresholds['blink_rate_min'] or
                 features['blink_rate'] > self.thresholds['blink_rate_max']):
-                risk_factors.append(f"Abnormal blink rate: {features['blink_rate']:.2f} per minute")
-                risk_level += 0.3  # Weight: 30%
+                risk_factors.append(f"Abnormal blink rate: {features['blink_rate']:.2f}/min (Range: {self.thresholds['blink_rate_min']}-{self.thresholds['blink_rate_max']})")
+                risk_level += weights['blink']
         
         # Ensure risk level is between 0 and 1
         risk_level = min(risk_level, 1.0)
