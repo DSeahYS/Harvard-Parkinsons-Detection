@@ -33,9 +33,10 @@ class EyeTracker:
         self.prev_landmarks = None
         self.prev_timestamp = None
         self.saccade_velocities = []
+        self.vertical_saccade_velocities = [] # Added for vertical saccades
         self.fixation_positions = []
         
-    def process_frame(self, frame):
+    def process_frame(self, frame, debug_mode=False): # Add debug_mode argument
         """Process a single frame and extract eye metrics"""
         current_timestamp = time.time()
         
@@ -43,10 +44,10 @@ class EyeTracker:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, _ = frame.shape
         
-        # Add tracking indicator text
-        cv2.putText(frame, "Eye Tracking Status", (20, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
+        if debug_mode:
+            # Add tracking indicator text only in debug mode
+            cv2.putText(frame, "Eye Tracking Status", (20, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         # Process the frame
         results = self.face_mesh.process(rgb_frame)
         
@@ -55,9 +56,10 @@ class EyeTracker:
         if results.multi_face_landmarks:
             face_landmarks = results.multi_face_landmarks[0]
             
-            # Display "Eyes Detected" in green
-            cv2.putText(frame, "Eyes Detected", (20, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            if debug_mode:
+                # Display "Eyes Detected" in green only in debug mode
+                cv2.putText(frame, "Eyes Detected", (20, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             # Extract eye landmarks
             left_eye = self._extract_eye_landmarks(face_landmarks, self.LEFT_EYE, w, h)
@@ -65,40 +67,43 @@ class EyeTracker:
             left_iris = self._extract_eye_landmarks(face_landmarks, self.LEFT_IRIS, w, h)
             right_iris = self._extract_eye_landmarks(face_landmarks, self.RIGHT_IRIS, w, h)
             
-            # Draw eye regions more prominently
-            for point in left_eye:
-                x, y = int(point[0]), int(point[1])
-                cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
-                
-            for point in right_eye:
-                x, y = int(point[0]), int(point[1])
-                cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
-            
-            # Highlight iris points with larger bright circles
-            for point in left_iris:
-                x, y = int(point[0]), int(point[1])
-                cv2.circle(frame, (x, y), 4, (255, 0, 0), -1)
-                
-            for point in right_iris:
-                x, y = int(point[0]), int(point[1])
-                cv2.circle(frame, (x, y), 4, (255, 0, 0), -1)
+            if debug_mode:
+                # Draw eye regions more prominently only in debug mode
+                for point in left_eye:
+                    x, y = int(point[0]), int(point[1])
+                    cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
+
+                for point in right_eye:
+                    x, y = int(point[0]), int(point[1])
+                    cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
+
+                # Highlight iris points with larger bright circles only in debug mode
+                for point in left_iris:
+                    x, y = int(point[0]), int(point[1])
+                    cv2.circle(frame, (x, y), 4, (255, 0, 0), -1)
+
+                for point in right_iris:
+                    x, y = int(point[0]), int(point[1])
+                    cv2.circle(frame, (x, y), 4, (255, 0, 0), -1)
             
             # Calculate eye metrics
             metrics = self._calculate_eye_metrics(left_eye, right_eye, left_iris, right_iris, current_timestamp)
             
-            # Show active metrics on frame
-            if 'avg_saccade_velocity' in metrics:
-                vel = metrics['avg_saccade_velocity']
-                cv2.putText(frame, f"Saccade: {vel:.1f}°/s", (20, 90),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            if debug_mode:
+                # Show active metrics on frame only in debug mode
+                if 'avg_saccade_velocity' in metrics:
+                    vel = metrics['avg_saccade_velocity']
+                    cv2.putText(frame, f"Saccade: {vel:.1f}°/s", (20, 90),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                if 'fixation_stability' in metrics:
+                    stab = metrics['fixation_stability']
+                    cv2.putText(frame, f"Fixation: {stab:.4f}", (20, 120),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
-            if 'fixation_stability' in metrics:
-                stab = metrics['fixation_stability']
-                cv2.putText(frame, f"Fixation: {stab:.4f}", (20, 120),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            
-            # Draw landmarks on the frame for visualization
-            self._draw_landmarks(frame, face_landmarks, w, h)
+            if debug_mode:
+                # Draw landmarks on the frame for visualization only in debug mode
+                self._draw_landmarks(frame, face_landmarks, w, h)
             
             # Store current landmarks for velocity calculation in next frame
             self.prev_landmarks = {
@@ -107,29 +112,35 @@ class EyeTracker:
             }
             self.prev_timestamp = current_timestamp
         else:
-            # Display "No eyes detected" in red
-            cv2.putText(frame, "No eyes detected", (20, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            
-            # Add troubleshooting tips
-            tips = ["Check lighting", "Face the camera", "Remove obstacles"]
-            y_pos = 90
-            for tip in tips:
-                cv2.putText(frame, tip, (30, y_pos),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-        # Log eye movements every 5 frames to avoid spamming console
+            if debug_mode:
+                # Display "No eyes detected" in red only in debug mode
+                cv2.putText(frame, "No eyes detected", (20, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                # Add troubleshooting tips only in debug mode
+                tips = ["Check lighting", "Face the camera", "Remove obstacles"]
+                y_pos = 90
+                for tip in tips:
+                    cv2.putText(frame, tip, (30, y_pos),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                    y_pos += 30
+
+        # Log eye movements every frame if eyes detected
         self._log_count += 1
-        if self._log_count % 5 == 0:
+        # if self._log_count % 5 == 0: # Remove throttling
+        if metrics: # Log only if metrics were calculated (eyes detected)
             self._log_eye_movements(metrics)
+
         
-            y_pos += 30
-        
-        # Add FPS counter
-        if hasattr(self, 'prev_timestamp') and self.prev_timestamp:
-            fps = 1.0 / (current_timestamp - self.prev_timestamp)
-            cv2.putText(frame, f"FPS: {fps:.1f}", (w - 120, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
+        if debug_mode:
+            # Add FPS counter only in debug mode
+            if hasattr(self, 'prev_timestamp') and self.prev_timestamp:
+                time_diff = current_timestamp - self.prev_timestamp
+                if time_diff > 0: # Avoid division by zero
+                    fps = 1.0 / time_diff
+                    cv2.putText(frame, f"FPS: {fps:.1f}", (w - 120, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
         return frame, metrics
     
     def _extract_eye_landmarks(self, face_landmarks, indices, frame_width, frame_height):
@@ -172,29 +183,46 @@ class EyeTracker:
         # Calculate saccade velocity if we have previous landmarks
         if self.prev_landmarks is not None and self.prev_timestamp is not None:
             time_diff = current_timestamp - self.prev_timestamp
-            
-            # Calculate displacement
+            if time_diff == 0: # Prevent division by zero later
+                return metrics # Return current metrics if no time passed
+
+            # Calculate overall and vertical displacement
             prev_left_iris = np.mean(self.prev_landmarks['left_iris'][:, :2], axis=0)
-            displacement = np.linalg.norm(left_iris_pos - prev_left_iris)
+            displacement_vector = left_iris_pos - prev_left_iris
+            displacement = np.linalg.norm(displacement_vector)
+            displacement_y = abs(displacement_vector[1]) # Vertical component displacement
             
             # Convert to degrees (approximate)
             # Assuming 1 pixel ≈ 0.05 degrees of visual angle
             degrees_displacement = displacement * 0.05
-            
-            # Calculate velocity in degrees/second
+            degrees_displacement_y = displacement_y * 0.05 # Vertical degrees
+
+            # Calculate overall and vertical velocity in degrees/second
             velocity = degrees_displacement / time_diff
-            
-            # Store velocity if it's likely a saccade (>50 deg/s)
-            if velocity > 50:
+            velocity_y = degrees_displacement_y / time_diff # Vertical velocity
+
+            # Store overall velocity if it's likely a saccade (>50 deg/s)
+            if velocity > 50: # Threshold for overall saccade detection
                 self.saccade_velocities.append(velocity)
                 if len(self.saccade_velocities) > 10:  # Keep last 10 saccades
                     self.saccade_velocities.pop(0)
-            
+
+                # Store vertical velocity only if an overall saccade is detected
+                self.vertical_saccade_velocities.append(velocity_y)
+                if len(self.vertical_saccade_velocities) > 10: # Keep last 10 vertical saccades
+                    self.vertical_saccade_velocities.pop(0)
+
+
             metrics['current_velocity'] = velocity
-            
-            # Calculate average saccade velocity
+            metrics['current_velocity_y'] = velocity_y # Store current vertical velocity
+
+            # Calculate average overall saccade velocity
             if self.saccade_velocities:
                 metrics['avg_saccade_velocity'] = np.mean(self.saccade_velocities)
+
+            # Calculate average vertical saccade velocity
+            if self.vertical_saccade_velocities:
+                metrics['avg_vertical_saccade_velocity'] = np.mean(self.vertical_saccade_velocities)
         
         return metrics
     
@@ -245,6 +273,8 @@ class EyeTracker:
         movement_log = "Eye Tracking: "
         if 'avg_saccade_velocity' in metrics:
             movement_log += f"Saccade: {metrics['avg_saccade_velocity']:.2f}°/s | "
+        if 'avg_vertical_saccade_velocity' in metrics: # Added log for vertical
+             movement_log += f"V-Saccade: {metrics['avg_vertical_saccade_velocity']:.2f}°/s | "
         if 'fixation_stability' in metrics:
             movement_log += f"Fixation: {metrics['fixation_stability']:.4f} | "
         if 'avg_ear' in metrics:
