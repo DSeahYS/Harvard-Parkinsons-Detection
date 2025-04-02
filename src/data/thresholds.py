@@ -7,7 +7,8 @@ PD_THRESHOLDS = {
     # Saccadic movement thresholds
     'saccade_velocity_min': 400.0,  # degrees/second - below this may indicate PD
     'saccade_velocity_max': 600.0,  # degrees/second - normal range upper limit
-    
+    'vertical_saccade_velocity_min': 200.0, # degrees/second - below this may indicate PD (Vertical)
+
     # Fixation stability threshold
     'fixation_stability': 0.3,      # variance in position - above this may indicate PD
     
