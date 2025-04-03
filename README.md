@@ -66,18 +66,18 @@ Clinical Validation: Submit case studies via research@GenomicGuard.io
 
 ## Maintained by: 
 Team Lead: Dave Seah Yong Sheng
+Physical Prototype: Timothy Wong
+Bio and medical related portions: Timothy Chua
 
 Review our Contribution Guidelines before submitting PRs.
 
 License 📄 
 Apache 2.0 License - See LICENSE for details
 
-## Patent Pending - GenomicGuard Detection Method (USPTO #20250329987) (Not done)
+## Patent Pending - GenomicGuard Detection Method (Not done)
 
-Last Updated: March 30, 2025
+Last Updated: April 3, 2025
 Maintained by GenomicGuard Research Collective
-Live Demo | Clinical White Paper
-
 
 # Example:
 ![image](https://github.com/user-attachments/assets/564ab41c-1dce-4eb8-9040-8ea24d06115e)
