@@ -129,6 +129,11 @@ Based on the ocular biomarkers and any available simulated genomic data, please 
 5.  **Summary Report**: Generate a concise clinical summary suitable for inclusion in a patient record or referral to a neurologist.
 
 Focus particularly on how the ocular metrics correlate with early-stage Parkinson's pathology. The fixation stability and saccade velocities (both overall and vertical) are especially relevant clinical indicators based on recent research. Ensure the language is professional and clinically appropriate.
+
+**MOH Requirements (Singapore Context):**
+- Include the standard NHG disclaimer for AI-assisted analysis if applicable.
+- Reference the latest SingHealth Parkinson's Disease Clinical Practice Guidelines (currently 2024).
+- Use terminology approved by the Singapore Medical Council (SMC) where relevant (e.g., specific referral pathways).
 """
 
         return prompt.strip() # Remove leading/trailing whitespace
