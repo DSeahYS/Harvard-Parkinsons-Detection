@@ -43,8 +43,9 @@ def create_metrics_visualization(metrics_history):
     
     # Plot EAR (Eye Aspect Ratio) over time
     if len(metrics_history) > 1:
-        ear_values = [m.get('avg_ear', 0) for m in metrics_history]
-        max_ear = max(ear_values) if ear_values else 0.3
+        # Filter out None values which occur in 'eye' mode
+        ear_values = [m.get('avg_ear') for m in metrics_history if m.get('avg_ear') is not None]
+        max_ear = max(ear_values) if ear_values else 0.3  # Default to 0.3 if no valid EAR values
         scale = (height - 20) / (max_ear or 0.3)
         
         points = []
@@ -62,6 +63,74 @@ def create_metrics_visualization(metrics_history):
     
     return vis
 
+def create_neuro_mirror(frame, metrics, ethnicity):
+    """
+    Creates an AR visualization overlay on the frame representing estimated
+    basal ganglia dopamine levels based on fixation stability and ethnicity.
+
+    Args:
+        frame (np.array): The input video frame (BGR).
+        metrics (dict): Dictionary containing eye tracking metrics, expecting 'fixation_stability'.
+        ethnicity (str): The detected or provided ethnicity ('chinese', 'malay', 'indian', 'default').
+
+    Returns:
+        np.array: The frame with the neuro-mirror overlay.
+                  Returns the original frame if metrics are missing.
+    """
+    if not metrics or 'fixation_stability' not in metrics:
+        # print("Warning: 'fixation_stability' not found in metrics for neuro_mirror.")
+        return frame # Return original frame if data is missing
+
+    # Ethnicity-based color mapping for dopamine level visualization
+    ETHNIC_COLORS = {
+        'chinese': (0, 255, 0),   # Green (higher stability -> more green)
+        'malay': (0, 255, 255),   # Yellow
+        'indian': (0, 165, 255),  # Orange
+        'default': (0, 0, 255)    # Red (lower stability -> more red)
+    }
+
+    # Normalize fixation stability (assuming lower is better, max instability around 0.3 based on feedback)
+    # Higher stability -> lower depletion value (closer to 0)
+    # Lower stability -> higher depletion value (closer to 1 or more)
+    max_instability_ref = 0.3 # Reference value for maximum instability
+    stability = metrics.get('fixation_stability', max_instability_ref) # Default to max if missing
+    depletion = min(max(stability / max_instability_ref, 0), 1.5) # Cap depletion factor somewhat
+
+    # Get color based on ethnicity, default to red
+    color = ETHNIC_COLORS.get(ethnicity.lower() if ethnicity else 'default', ETHNIC_COLORS['default'])
+
+    # Create pulsating effect based on time
+    # The size of the pulse could potentially be linked to another metric, e.g., saccade velocity?
+    pulse_base_radius = 30
+    pulse_amplitude = 20
+    pulse = int(pulse_base_radius + pulse_amplitude * (1 + np.sin(time.time() * 3)) / 2) # Smoother pulse 0-1 range
+
+    # Determine center - using fixed values assumes 640x480 frame. Better to calculate.
+    h, w, _ = frame.shape
+    center_x, center_y = w // 2, h // 2 # Center of the frame
+
+    # Draw the pulsating circle representing dopamine level (inversely related to depletion)
+    # Make the circle smaller/dimmer with higher depletion (lower dopamine)
+    # We can adjust alpha (transparency) or radius based on depletion
+    
+    # Option 1: Adjust radius based on depletion (smaller = more depleted)
+    # display_radius = int(pulse * (1 - depletion * 0.7)) # Reduce radius significantly with depletion
+    
+    # Option 2: Adjust color intensity/alpha (requires creating an overlay)
+    overlay = frame.copy()
+    cv2.circle(overlay, (center_x, center_y), pulse, color, -1)
+    
+    # Adjust alpha based on depletion (more transparent = more depleted)
+    alpha = max(0.1, 1.0 - depletion * 0.6) # Ensure minimum visibility
+    
+    # Blend the overlay with the original frame
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+    # Add a small text indicator (optional)
+    cv2.putText(frame, f"Est. Dopamine Level ({ethnicity})", (center_x - 100, center_y - pulse - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+    return frame
 def main():
     # Initialize the webcam
     cap = cv2.VideoCapture(0)
@@ -121,3 +190,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
