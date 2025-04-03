@@ -1,15 +1,41 @@
 import numpy as np
 from collections import deque
-from src.data.thresholds import PD_THRESHOLDS # Import the thresholds
+from src.data.thresholds import PD_THRESHOLDS, RECOMMENDATIONS, RISK_LEVELS # Import more from thresholds
+
+# Singapore-specific referral logic
+SINGAPORE_REFERRALS = {
+    'low': "Polyclinic follow-up recommended.",
+    'medium': "Referral to NNI General Neurology recommended.",
+    'high': "Urgent referral to NNI Movement Disorders Clinic recommended."
+}
+
+def get_referral(risk_level):
+    """Determines the Singapore-specific referral pathway based on risk level."""
+    if risk_level < RISK_LEVELS['low'][1]: # Use thresholds from imported RISK_LEVELS
+        level = 'low'
+    elif risk_level < RISK_LEVELS['medium'][1]:
+        level = 'medium'
+    else:
+        level = 'high'
+    return SINGAPORE_REFERRALS.get(level, SINGAPORE_REFERRALS['low']) # Default to low
 
 class ParkinsonsDetector:
-    def __init__(self, window_size=30):
-        # Buffer for metrics history
+    def __init__(self, window_size=30, trend_window_velocity=7, trend_window_fixation=30):
+        # Buffer for metrics history over the analysis window
         self.metrics_history = deque(maxlen=window_size)
         
         # Clinical thresholds for Parkinson's detection - Load from imported dict
         self.thresholds = PD_THRESHOLDS
-    
+        
+        # Buffers for longitudinal trend analysis (storing window averages)
+        self.trend_analyzer = {
+            # Store avg velocity over the window for the last 7 analyses (e.g., weekly if run daily)
+            'velocity': deque(maxlen=trend_window_velocity),
+            # Store avg fixation stability over the window for the last 30 analyses (e.g., monthly if run daily)
+            'fixation': deque(maxlen=trend_window_fixation)
+        }
+        print(f"Initialized ParkinsonsDetector with window: {window_size}, trend windows: V={trend_window_velocity}, F={trend_window_fixation}")
+
     def analyze_metrics(self, metrics):
         """Analyze eye metrics for Parkinson's indicators"""
         # Add current metrics to history
@@ -114,11 +140,46 @@ class ParkinsonsDetector:
                 risk_level += weights['blink']
         
         # Ensure risk level is between 0 and 1
-        risk_level = min(risk_level, 1.0)
-        
+        risk_level = min(max(risk_level, 0.0), 1.0) # Also ensure >= 0
+
+        # --- Longitudinal Trend Update ---
+        # Store the calculated average features for this window into the trend deques
+        if 'avg_saccade_velocity' in features:
+            self.trend_analyzer['velocity'].append(features['avg_saccade_velocity'])
+        if 'avg_fixation_stability' in features:
+             self.trend_analyzer['fixation'].append(features['avg_fixation_stability'])
+        # Note: Actual trend *calculation* (e.g., slope) is not implemented here yet, just data storage.
+
+        # --- Singapore Specific Recommendations & Referral ---
+        recommendation = RECOMMENDATIONS.get('low') # Default recommendation
+        if risk_level >= RISK_LEVELS['high'][0]:
+             recommendation = RECOMMENDATIONS.get('high')
+             # Add Singapore-specific high-risk recommendation
+             recommendation += " Consider referral to SGH Neurodegenerative Cohort Study."
+        elif risk_level >= RISK_LEVELS['medium'][0]:
+             recommendation = RECOMMENDATIONS.get('medium')
+
+        referral = get_referral(risk_level) # Get SG referral pathway
+
         return {
             'analysis_complete': True,
             'risk_level': risk_level,
             'risk_factors': risk_factors,
-            'features': features
+            'features': features, # Features calculated over the current window
+            'recommendation': recommendation, # General + SG specific recommendation
+            'referral': referral # SG specific referral pathway
+            # 'trends': self._calculate_trends() # Could add trend calculation results here later
         }
+        
+    # Placeholder for future trend calculation logic
+    # def _calculate_trends(self):
+    #     trends = {}
+    #     if len(self.trend_analyzer['velocity']) > 1:
+    #         # Example: Calculate slope using linear regression or simple difference
+    #         # trends['velocity_trend'] = ...
+    #         pass
+    #     if len(self.trend_analyzer['fixation']) > 1:
+    #         # trends['fixation_trend'] = ...
+    #         pass
+    #     return trends
+
