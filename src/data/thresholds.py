@@ -20,6 +20,20 @@ PD_THRESHOLDS = {
     'antisaccade_error': 2.1,        # errors per second - above may indicate PD
 }
 
+# Singapore-specific vertical saccade thresholds (degrees/second)
+# Lower values indicate potential abnormality (slower vertical saccades)
+# Note: These are thresholds *below which* might indicate PD, consistent with PD_THRESHOLDS['vertical_saccade_velocity_min']
+# However, the implementation in eye_tracker checks for velocity *above* a threshold.
+# This dictionary defines the *threshold* value itself, which can be used for either comparison.
+# The eye_tracker implementation uses these values as a *lower bound* for *normal* fast saccades.
+VERTICAL_SACCADE_THRESHOLDS = {
+    'chinese': 190.0,
+    'malay': 185.0,
+    'indian': 188.0,
+    'default': 200.0  # Default threshold from PD_THRESHOLDS
+}
+
+
 # Clinical interpretation guidelines
 RISK_LEVELS = {
     'low': (0.0, 0.3),
@@ -33,3 +47,4 @@ RECOMMENDATIONS = {
     'medium': "Recommend follow-up in 6 months. Consider additional neurological testing.",
     'high': "Prompt referral to neurologist recommended. Consider DaTscan or other confirmatory tests."
 }
+
