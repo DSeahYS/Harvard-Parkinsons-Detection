@@ -57,11 +57,15 @@ Eye tracking metrics correlated with UPDRS-III scores
 Genomic simulation based on Singapore-specific variant prevalence
 Risk scoring system aligns with MOH clinical guidelines
 
-Contributors 🤝
+# Example:
+ ![image](https://github.com/user-attachments/assets/564ab41c-1dce-4eb8-9040-8ea24d06115e)
+ ![image](https://github.com/user-attachments/assets/cc8359d9-1459-4811-b085-b6fd85761473)
+ ![image](https://github.com/user-attachments/assets/f181eb41-6635-4a95-9160-773c3617ae24)
+
+ 
+## Contributors 🤝
 Team Lead: Dave Seah Yong Sheng
-
 Physical Prototype: Timothy Wong
-
 Bio and Medical Portions: Timothy Chua
 
 License 📄
