@@ -1,6 +1,7 @@
 import numpy as np
 from collections import deque
 from src.data.thresholds import PD_THRESHOLDS, RECOMMENDATIONS, RISK_LEVELS # Import more from thresholds
+from src.genomic.bionemo_client import BioNeMoSimulator # Import the simulator
 
 # Singapore-specific referral logic
 SINGAPORE_REFERRALS = {
@@ -21,6 +22,9 @@ def get_referral(risk_level):
 
 class ParkinsonsDetector:
     def __init__(self, window_size=30, trend_window_velocity=7, trend_window_fixation=30):
+        # Initialize BioNeMo simulator
+        self.bionemo = BioNeMoSimulator()
+        
         # Buffer for metrics history over the analysis window
         self.metrics_history = deque(maxlen=window_size)
         
@@ -36,11 +40,54 @@ class ParkinsonsDetector:
         }
         print(f"Initialized ParkinsonsDetector with window: {window_size}, trend windows: V={trend_window_velocity}, F={trend_window_fixation}")
 
-    def analyze_metrics(self, metrics):
-        """Analyze eye metrics for Parkinson's indicators"""
-        # Add current metrics to history
-        if metrics:
-            self.metrics_history.append(metrics)
+    # Existing methods (_extract_features, _analyze_features) remain largely the same...
+    # ... but we need a primary 'predict' method for the dashboard to call.
+
+    def predict(self, metrics_data, ethnicity='chinese'):
+        """
+        Analyzes metrics, combines with genomic simulation, and returns risk level and factors.
+        This is the main method the dashboard should call.
+        Args:
+            metrics_data: Can be a single metric dict or a list from a cycle.
+            ethnicity: Patient's ethnicity for genomic simulation.
+        Returns:
+            tuple: (combined_risk_level, risk_factors_list)
+        """
+        # 1. Analyze Eye Metrics
+        if isinstance(metrics_data, list): # Data from a cycle
+            # Add all metrics from the cycle to history for analysis
+            for m in metrics_data:
+                 if m: self.metrics_history.append(m)
+        elif isinstance(metrics_data, dict): # Single frame data
+             if metrics_data: self.metrics_history.append(metrics_data)
+        else:
+             return 0.0, ["Invalid metrics data format"] # Return default low risk and error
+
+        eye_analysis = self.analyze_metrics(None) # Pass None as we've already added to history
+
+        if not eye_analysis.get('analysis_complete', False):
+            # Not enough data yet, return low risk and message
+            return 0.0, [eye_analysis.get('message', "Collecting data...")]
+
+        eye_risk = eye_analysis.get('risk_level', 0.0)
+        eye_factors = eye_analysis.get('risk_factors', [])
+        
+        # 2. Get Full Analysis (including simulated genomics)
+        # Use the calculated eye_risk and provided ethnicity
+        full_analysis = self.get_full_analysis(eye_risk, ethnicity)
+
+        combined_risk = full_analysis.get('combined_risk', eye_risk) # Fallback to eye_risk
+        
+        # Combine factors (optional, could just return eye factors)
+        # For now, just return the eye factors as they are more directly interpretable
+        # TODO: Potentially add genomic factors if needed by UI
+        
+        return combined_risk, eye_factors # Return combined risk and eye factors
+
+    # Keep analyze_metrics as an internal method called by predict
+    def analyze_metrics(self, metrics): # metrics arg is now less relevant here, history is managed by predict
+        """Analyze eye metrics from the internal history buffer for Parkinson's indicators"""
+        # Note: metrics argument is ignored as history is populated by predict()
         
         # Only analyze when we have enough data
         if len(self.metrics_history) < self.metrics_history.maxlen:
@@ -80,12 +127,16 @@ class ParkinsonsDetector:
             features['avg_fixation_stability'] = np.mean(fixation_stabilities)
         
         # Extract EAR values for blink detection
-        ear_values = [m.get('avg_ear', 1.0) for m in self.metrics_history if 'avg_ear' in m]
+        # Extract EAR values, filtering out None values which occur in 'eye' mode
+        ear_values = [m.get('avg_ear') for m in self.metrics_history if m.get('avg_ear') is not None]
         if ear_values:
             # Simple blink detection (EAR drops below 0.2)
             blink_count = 0
             for i in range(1, len(ear_values)):
-                if ear_values[i-1] > 0.2 and ear_values[i] <= 0.2:
+                # Ensure both values being compared are not None before comparison
+                # Note: The list comprehension already filters Nones, but this adds safety.
+                if ear_values[i-1] is not None and ear_values[i] is not None and \
+                   ear_values[i-1] > 0.2 and ear_values[i] <= 0.2:
                     blink_count += 1
             
             # Convert to blinks per minute (assuming 30 FPS)
@@ -170,6 +221,25 @@ class ParkinsonsDetector:
             'referral': referral # SG specific referral pathway
             # 'trends': self._calculate_trends() # Could add trend calculation results here later
         }
+
+    def get_full_analysis(self, eye_risk_level, ethnicity):
+        """
+        Combines eye tracking risk with simulated genomic analysis.
+        Args:
+            eye_risk_level (float): Risk level derived from eye metrics (0-1).
+            ethnicity (str): Patient's ethnicity (e.g., 'chinese', 'malay', 'indian').
+        Returns:
+            dict: Contains eye_risk, genomic_risk, and combined_risk.
+        """
+        genomic = self.bionemo.analyze_genomics(eye_risk_level, ethnicity)
+        combined_risk = 0.6 * eye_risk_level + 0.4 * genomic['genomic_risk_score']
+        
+        return {
+            'eye_risk': eye_risk_level,
+            'genomic_risk': genomic['genomic_risk_score'],
+            'combined_risk': min(max(combined_risk, 0.0), 1.0), # Clamp combined risk
+            'genomic_details': genomic # Include raw genomic simulation results
+        }
         
     # Placeholder for future trend calculation logic
     # def _calculate_trends(self):
@@ -182,4 +252,3 @@ class ParkinsonsDetector:
     #         # trends['fixation_trend'] = ...
     #         pass
     #     return trends
-
