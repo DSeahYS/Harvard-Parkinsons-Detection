@@ -19,7 +19,6 @@ DeepSeek V3 LLM integration for clinical assessment
 Detects neurological markers 5-7 years before motor symptoms appear
 
 ## System Architecture 🖥️
-graph TD
     A[Webcam Input] --> B[EyeTracker]
     B --> C[Eye Metrics Collection]
     C --> D[ParkinsonsDetector]
