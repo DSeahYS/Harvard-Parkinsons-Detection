@@ -1,45 +1,45 @@
-import cv2
-import numpy as np
-import time
-import os
-import absl.logging
-from collections import deque
-from dotenv import load_dotenv # Added
+"""
+GenomeGuard - Parkinson's Detection System
 
+A system that combines eye tracking and genomic analysis to detect early signs of Parkinson's disease.
+"""
+import os
 # Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
-# Initialize absl logging to avoid feedback tensor warnings
-absl.logging.set_verbosity(absl.logging.ERROR)
-
-# Load environment variables from .env file
-load_dotenv(dotenv_path='GenomeGuard/.env') # Specify path relative to project root
+# Suppress MediaPipe warnings
+os.environ['GLOG_minloglevel'] = '2'
+import numpy as np
+from datetime import datetime
+import logging
 
 from src.models.eye_tracker import EyeTracker
 from src.models.pd_detector import ParkinsonsDetector
-from src.utils.visualization import create_metrics_visualization, create_risk_meter
 from src.frontend.dashboard import Dashboard
-from src.utils.cycle_buffer import CycleBuffer
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    filename='genomicguard.log'
+)
 
 def main():
-    # Initialize components
-    eye_tracker = EyeTracker()
-    pd_detector = ParkinsonsDetector()
-    metrics_history = deque(maxlen=90)  # 3 seconds at 30 FPS
-
-    # Initialize cycle buffer
-    cycle_buffer = CycleBuffer(cycle_duration=15)
-
-    # Create dashboard with components
-    dashboard = Dashboard(eye_tracker, pd_detector, metrics_history)
-
-    # Run the dashboard
-    dashboard.run()
-
-    # Clean up
-    if dashboard.cap:
-        dashboard.cap.release()
-    cv2.destroyAllWindows()
+    """Main function to initialize and run the application."""
+    try:
+        # Initialize components
+        eye_tracker = EyeTracker()
+        pd_detector = ParkinsonsDetector()
+        
+        # Initialize metrics history
+        metrics_history = []
+        
+        # Create and run dashboard
+        dashboard = Dashboard(eye_tracker, pd_detector, metrics_history)
+        dashboard.run()
+        
+    except Exception as e:
+        logging.error(f"Error in main function: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
