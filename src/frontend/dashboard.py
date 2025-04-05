@@ -1,865 +1,869 @@
-import os
-import cv2
-import numpy as np
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox # Add messagebox
+from tkinter import ttk, messagebox, simpledialog, Listbox, Scrollbar, Frame, Label, Button, Canvas, Text
 from PIL import Image, ImageTk
+import cv2
+import queue
+import threading
+import logging
 import time
-import json
-from src.utils.visualization import create_metrics_visualization, create_risk_meter
-from src.data.storage import DataStorage, NumpyEncoder # Import DataStorage & NumpyEncoder
+import numpy as np
+import os
+import json # Added for LLM result parsing example
+
+# --- Project Imports ---
+# Use absolute imports from the project root assuming 'src' is in PYTHONPATH
+# or adjust relative paths carefully based on execution context.
+# If running dashboard.py directly, relative paths might need adjustment or
+# run using `python -m src.frontend.dashboard` from the GenomeGuard directory.
+try:
+    from ..models.eye_tracker import EyeTracker
+    from ..models.pd_detector import PDDetector
+    from ..genomic.bionemo_client import BioNeMoClient
+    from ..llm.openrouter_client import OpenRouterClient
+    from ..data.storage import StorageManager
+    from ..utils.threading_utils import RTSPCameraStream, ProcessingThread, GenomicAnalysisThread
+    from ..utils import visualization # Import the visualization module
+except ImportError:
+    # Fallback for running script directly (adjust as needed)
+    import sys
+    sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..')) # Add GenomeGuard root to path
+    from src.models.eye_tracker import EyeTracker
+    from src.models.pd_detector import PDDetector
+    from src.genomic.bionemo_client import BioNeMoClient
+    from src.llm.openrouter_client import OpenRouterClient
+    from src.data.storage import StorageManager
+    from src.utils.threading_utils import RTSPCameraStream, ProcessingThread, GenomicAnalysisThread
+    from src.utils import visualization
+
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 
 class Dashboard:
-    def __init__(self, eye_tracker, pd_detector, metrics_history, window_title="GenomicGuard: Early Parkinson's Detection"):
-        # Store components
-        self.eye_tracker = eye_tracker
-        self.pd_detector = pd_detector
-        self.metrics_history = metrics_history
-        self.storage = DataStorage() # Initialize storage
+    """
+    Main Tkinter-based GUI for GenomeGuard application.
+    Manages data processing threads and displays results.
+    """
+    def __init__(self, root):
+        self.root = root
+        self.root.title("GenomeGuard - Parkinson's Risk Assessment")
+        # Set a default size
+        self.root.geometry("1200x800")
 
-        # Create main window FIRST
-        self.window = tk.Tk()
-        self.window.title(window_title)
-        self.window.minsize(1200, 700)
+        # --- Initialize Core Components ---
+        logging.info("Initializing core components...")
+        self.storage = StorageManager() # Singleton instance
+        self.eye_tracker = EyeTracker(refine_landmarks=True) # Use refined landmarks
+        self.pd_detector = PDDetector()
+        self.bionemo_client = BioNeMoClient() # Placeholder/real client
+        self.openrouter_client = OpenRouterClient() # Placeholder/real client
+        logging.info("Core components initialized.")
 
-        # --- Initialize UI Variables (AFTER creating self.window) ---
-        # Tracking Variables
-        self.running = False # Non-Tkinter var, can be earlier
-        self.cap = None      # Non-Tkinter var
-        self.after_id = None # Non-Tkinter var
-        self.cycle_start_time = None
-        self.cycle_metrics = []
-        self.debug_mode = False # Initialize debug mode flag here
+        # --- Initialize Threading Components ---
+        logging.info("Initializing threading components...")
+        self.processing_result_queue = queue.Queue(maxsize=10) # Queue for results from ProcessingThread
+        self.genomic_input_queue = queue.Queue()   # Queue to send data TO GenomicAnalysisThread
+        self.genomic_output_queue = queue.Queue() # Queue for results FROM GenomicAnalysisThread
 
-        # Patient Profile Variables (Moved earlier)
-        self.patient_name_var = tk.StringVar()
-        self.patient_age_var = tk.StringVar()
-        self.patient_gender_var = tk.StringVar(value='Male')
-        self.patient_var = tk.StringVar() # For the patient ID combobox
-        self.ethnicity_var = tk.StringVar(value='chinese') # For ethnicity combobox
+        self.camera_stream = None # Will be initialized in start_processing
+        self.processing_thread = None
+        self.genomic_thread = None
+        logging.info("Threading components initialized.")
 
-        # Eye Tracking Control Variables
-        self.mode_var = tk.StringVar(value='face') # For face/eye mode radio buttons
-        self.cycle_var = tk.BooleanVar(value=False) # For 15s cycle checkbox
+        # --- State Variables ---
+        self.is_processing = False
+        self.current_patient_id = None
+        self.current_patient_info = {}
+        self.current_session_id = None
+        self.session_data_log = [] # Store detailed metrics for saving later
+        self.last_risk_level = None # Store last known risk level
+        self.last_eye_metrics_raw = None # Store last known raw metrics
+        self.last_eye_metrics_summary = None # Store last known summary
+        self.last_genomic_result = None # Store last known genomic result
+        self.selected_history_session_id = None # Track selected past session ID
+        self.loaded_history_session_data = None # Store loaded data for selected past session
 
-        # --- Create and Setup Tabs ---
-        self.tab_control = ttk.Notebook(self.window)
+        # --- Setup UI ---
+        self._setup_ui()
 
-        # Eye tracking tab
-        self.eye_tab = ttk.Frame(self.tab_control)
-        self.tab_control.add(self.eye_tab, text="Eye Tracking")
-        self.setup_eye_tracking_tab(self.eye_tab) # Uses mode_var, cycle_var
+        # --- Handle Window Closing ---
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Genomic analysis tab
-        self.genomic_tab = ttk.Frame(self.tab_control)
-        self.tab_control.add(self.genomic_tab, text="Genomic Analysis")
-        self.setup_genomic_tab(self.genomic_tab) # No specific vars needed before call
-
-        # Patient analysis tab
-        self.patient_tab = ttk.Frame(self.tab_control)
-        self.tab_control.add(self.patient_tab, text="Patient Analysis")
-        # Uses patient_*, ethnicity_var - they are initialized now
-        self.setup_patient_tab(self.patient_tab)
-
-        # Pack the tab control after setting up all tabs
-        self.tab_control.pack(expand=1, fill="both")
-
-        # Initial population of patient list happens inside setup_patient_tab
-
-    def setup_eye_tracking_tab(self, parent):
-        # Create frames
-        self.left_frame = ttk.Frame(parent, padding=10)
-        self.left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.right_frame = ttk.Frame(parent, padding=10)
-        self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-
-        # Create canvas for webcam feed
-        self.canvas = tk.Canvas(self.left_frame, width=640, height=480)
-        self.canvas.pack(padx=10, pady=10)
-
-        # Create eye tracking visualization area
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        from matplotlib.figure import Figure
-        
-        fig = Figure(figsize=(5, 3), dpi=100)
-        self.eye_plot = fig.add_subplot(111)
-        self.eye_plot.set_title("Eye Movement Tracking")
-        self.eye_plot.set_xlim(-1, 1)  # Normalized coordinates
-        self.eye_plot.set_ylim(-1, 1)
-        self.eye_canvas = FigureCanvasTkAgg(fig, master=self.left_frame)
-        self.eye_canvas.get_tk_widget().pack(padx=10, pady=10)
-
-        # Create controls
-        self.controls_frame = ttk.LabelFrame(self.left_frame, text="Controls", padding=10)
-        self.controls_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        # Add mode switch
-        self.mode_var = tk.StringVar(value='face')
-        ttk.Radiobutton(self.controls_frame, text="Face Mode", variable=self.mode_var, 
-                       value='face', command=self.update_tracker_mode).pack(side=tk.LEFT)
-        ttk.Radiobutton(self.controls_frame, text="Eye Mode", variable=self.mode_var,
-                       value='eye', command=self.update_tracker_mode).pack(side=tk.LEFT)
-
-        self.btn_start = ttk.Button(self.controls_frame, text="Start", command=self.on_start)
-        self.btn_start.pack(side=tk.LEFT, padx=5)
-
-        self.btn_stop = ttk.Button(self.controls_frame, text="Stop", command=self.on_stop)
-        self.btn_stop.pack(side=tk.LEFT, padx=5)
-
-        self.btn_debug = ttk.Button(self.controls_frame, text="Debug View", command=self.toggle_debug)
-        self.btn_debug.pack(side=tk.LEFT, padx=5)
-        self.debug_mode = False
-
-        # Add 15-second cycle checkbox
-        self.cycle_var = tk.BooleanVar(value=False)
-        self.cycle_check = ttk.Checkbutton(self.controls_frame, text="15s Analysis Cycles",
-                                         variable=self.cycle_var)
-        self.cycle_check.pack(side=tk.LEFT, padx=5)
-
-        # Create metrics frame
-        self.metrics_frame = ttk.LabelFrame(self.right_frame, text="Eye Metrics", padding=10)
-        self.metrics_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        # Text widget for metrics
-        self.metrics_text = tk.Text(self.metrics_frame, width=40, height=10)
-        self.metrics_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        # Create risk assessment frame
-        self.risk_frame = ttk.LabelFrame(self.right_frame, text="Risk Assessment", padding=10)
-        self.risk_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        # Risk meter label
-        self.risk_label = ttk.Label(self.risk_frame, text="Risk Level: Collecting data...")
-        self.risk_label.pack(padx=5, pady=5)
-
-        # Canvas for risk meter visualization
-        self.risk_canvas = tk.Canvas(self.risk_frame, width=400, height=100)
-        self.risk_canvas.pack(padx=5, pady=5)
-
-        # Frame for risk factors
-        self.factors_frame = ttk.LabelFrame(self.risk_frame, text="Risk Factors", padding=10)
-        self.factors_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        # Text widget for risk factors
-        self.factors_text = tk.Text(self.factors_frame, width=40, height=10)
-        self.factors_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        # Canvas for metrics visualization
-        self.vis_canvas = tk.Canvas(self.right_frame, width=400, height=300)
-        self.vis_canvas.pack(padx=10, pady=10)
-
-    def update_tracker_mode(self):
-        """Update the eye tracker mode based on UI selection"""
-        self.eye_tracker.current_mode = self.mode_var.get()
-        self.eye_tracker._init_face_mesh()
-        self.metrics_text.insert(tk.END, f"Switched to {self.mode_var.get()} mode\n")
-
-    def on_start(self):
-        """Start the eye tracking process"""
-        if not self.running:
-            self.cycle_start_time = None # Reset cycle timer on start
-            self.cycle_metrics = []      # Reset cycle metrics on start
-            try:
-                self.running = True
-                self.cap = cv2.VideoCapture(0)  # Open default camera
-                if not self.cap.isOpened():
-                    raise RuntimeError("Could not open video device")
-                
-                self.metrics_text.insert(tk.END, "Started eye tracking...\n")
-                self.btn_start.config(state=tk.DISABLED)
-                self.btn_stop.config(state=tk.NORMAL)
-                self.update_frame()
-                
-            except Exception as e:
-                self.running = False
-                if self.cap:
-                    self.cap.release()
-                    self.cap = None
-                self.metrics_text.insert(tk.END, f"Error: {str(e)}\n")
-                self.btn_start.config(state=tk.NORMAL)
-
-    def on_stop(self):
-        """Stop the eye tracking process"""
-        if self.running:
-            self.running = False
-            if self.after_id:
-                self.window.after_cancel(self.after_id)
-                self.after_id = None
-            if self.cap:
-                self.cap.release()
-                self.cap = None
-            self.metrics_text.insert(tk.END, "Stopped eye tracking\n")
-            self.btn_start.config(state=tk.NORMAL)
-            self.btn_stop.config(state=tk.DISABLED)
-
-    def update_frame(self):
-        """Update the video frame and process eye tracking"""
-        if self.running and self.cap:
-            try:
-                ret, frame = self.cap.read()
-                if not ret or frame is None:
-                    raise ValueError("Failed to read frame from camera")
-                
-                # Process frame with eye tracker (returns processed frame + metrics)
-                processed_frame, metrics = self.eye_tracker.process_frame(
-                    frame,
-                    debug_mode=self.debug_mode
-                )
-                
-                # Update frame with potentially drawn debug info
-                frame = processed_frame
-                
-                # Always update metrics (may contain error messages)
-                self.update_metrics(metrics)
-                
-                # Handle 15-second analysis cycle
-                if self.cycle_var.get():
-                    if self.cycle_start_time is None:
-                        self.cycle_start_time = time.time()
-                    
-                    if isinstance(metrics, dict) and metrics.get('error') is None:
-                        self.cycle_metrics.append(metrics)
-                    
-                    if time.time() - self.cycle_start_time >= 15.0 and self.cycle_metrics:
-                        print(f"Processing {len(self.cycle_metrics)} metrics from the last 15 seconds...")
-                        self.process_cycle_metrics(self.cycle_metrics)
-                        self.cycle_metrics = []
-                        self.cycle_start_time = None
-                else:
-                    # If cycle mode is off, reset
-                    self.cycle_start_time = None
-                    self.cycle_metrics = []
-
-            except Exception as e:
-                error_msg = f"Frame processing error: {str(e)}"
-                print(error_msg)
-                self.metrics_text.insert(tk.END, error_msg + "\n")
-                # Continue running despite the error
-                
-                # Convert frame to RGB and display with robust error handling
-                try:
-                    if frame is None or frame.size == 0:
-                        frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    else:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    
-                    img = Image.fromarray(frame)
-                    imgtk = ImageTk.PhotoImage(image=img)
-                    self.canvas.imgtk = imgtk
-                    self.canvas.create_image(0, 0, anchor=tk.NW, image=imgtk)
-                except Exception as e:
-                    print(f"Error displaying frame: {str(e)}")
-                    # Fallback to blank frame
-                    blank_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    img = Image.fromarray(blank_frame)
-                    imgtk = ImageTk.PhotoImage(image=img)
-                    self.canvas.imgtk = imgtk
-                    self.canvas.create_image(0, 0, anchor=tk.NW, image=imgtk)
-                self.canvas.create_image(0, 0, anchor=tk.NW, image=imgtk)
-                
-                # Schedule next frame update
-                self.after_id = self.window.after(10, self.update_frame)
-
-    def process_cycle_metrics(self, metrics_list):
-        """Process metrics collected over a 15-second cycle."""
-        if not metrics_list:
-            return
-            
-        try:
-            # Ensure we're working with a list of dictionaries
-            valid_metrics = [m for m in metrics_list if isinstance(m, dict)]
-            
-            if not valid_metrics:
-                print("No valid metrics found in cycle")
-                return
-                
-            print(f"Processing cycle with {len(valid_metrics)} valid data points")
-            
-            # Calculate aggregated metrics
-            metrics = {
-                'avg_saccade_velocity': np.mean([
-                    m.get('avg_saccade_velocity', 0)
-                    for m in valid_metrics
-                    if 'avg_saccade_velocity' in m
-                ]).item() if len(valid_metrics) > 0 else 0,
-                
-                'avg_fixation_stability': np.mean([
-                    m.get('avg_fixation_stability', 0)
-                    for m in valid_metrics
-                    if 'avg_fixation_stability' in m
-                ]).item() if len(valid_metrics) > 0 else 0,
-                
-                'mode': valid_metrics[-1].get('mode', 'face')  # Use most recent mode
-            }
-            
-            ethnicity = self.ethnicity_var.get() if hasattr(self, 'ethnicity_var') else 'chinese'
-            self.update_risk_assessment(metrics, ethnicity)
-            
-        except Exception as e:
-            print(f"Error processing cycle metrics: {str(e)}")
-        self.update_risk_assessment(metrics_list, ethnicity)
-
-    def update_risk_assessment(self, metrics_data, ethnicity='chinese'):
-        """Update the risk assessment with robust error handling"""
-        if not metrics_data:
-            return
-            
-        try:
-            # Ensure input is in correct format
-            if isinstance(metrics_data, np.ndarray):
-                metrics_data = metrics_data.item() if metrics_data.size == 1 else metrics_data.tolist()
-                
-            if isinstance(metrics_data, list):
-                # Use last valid metric if available
-                prediction_input = next((m for m in reversed(metrics_data) if isinstance(m, dict)), {})
-            elif isinstance(metrics_data, dict):
-                prediction_input = metrics_data
-            else:
-                raise ValueError("Invalid metrics data format")
-
-            risk_level, factors = self.pd_detector.predict(prediction_input, ethnicity)
-            # If it's a list (from cycle), maybe average or use sequence
-            if isinstance(metrics_data, list):
-                 # Placeholder: Use the last metric or average specific features
-                 if metrics_data:
-                     prediction_input = metrics_data[-1] # Example: use last metric
-                 else: return
-            else: # Single metric dict
-                 prediction_input = metrics_data
-
-            # TODO: Ensure prediction_input format matches pd_detector expectations
-            # Pass ethnicity to the detector's predict method
-            risk_level, factors = self.pd_detector.predict(prediction_input, ethnicity=ethnicity)
-
-            # Update UI
-            self.risk_label.config(text=f"Risk Level: {risk_level}")
-            
-            # Update risk meter visualization
-            img = create_risk_meter(risk_level) # Assuming this returns a PIL Image
-            self.risk_meter_imgtk = ImageTk.PhotoImage(image=img)
-            self.risk_canvas.delete("all") # Clear previous drawing
-            self.risk_canvas.create_image(0, 0, anchor=tk.NW, image=self.risk_meter_imgtk)
-
-            # Update factors text
-            self.factors_text.delete(1.0, tk.END)
-            self.factors_text.insert(tk.END, "Contributing Factors:\n")
-            if factors:
-                 for factor, value in factors.items():
-                      self.factors_text.insert(tk.END, f"- {factor}: {value}\n")
-            else:
-                 self.factors_text.insert(tk.END, "N/A\n")
-
-        except Exception as e:
-            print(f"Error during risk assessment: {e}")
-            self.risk_label.config(text="Risk Level: Error")
-            self.factors_text.delete(1.0, tk.END)
-            self.factors_text.insert(tk.END, f"Error: {e}\n")
-
-
-    def run(self):
-        """Run the main application loop"""
-        try:
-            # Bind close event
-            self.window.protocol("WM_DELETE_WINDOW", self.close)
-            self.window.mainloop()
-        except Exception as e:
-            print(f"Error running application: {e}")
-        finally:
-            # Ensure cleanup happens even if mainloop errors
-            self.close()
-
-    def setup_genomic_tab(self, parent):
-        """Setup the genomic analysis tab"""
-        # Create main frame
-        main_frame = ttk.Frame(parent, padding=10)
+    def _setup_ui(self):
+        """Creates the main UI layout."""
+        logging.info("Setting up UI...")
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Analysis controls frame
-        controls_frame = ttk.LabelFrame(main_frame, text="Genomic Analysis Controls", padding=10)
-        controls_frame.pack(fill=tk.X, padx=10, pady=10)
+        # --- Left Panel (Controls, Patient Info) ---
+        left_panel = ttk.Frame(main_frame, width=300)
+        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        left_panel.pack_propagate(False) # Prevent resizing based on content
 
-        # Add analysis button
-        self.btn_run_genomic = ttk.Button(controls_frame, text="Run Analysis",
-                                        command=self.run_bionemo_analysis)
-        self.btn_run_genomic.pack(side=tk.LEFT, padx=5)
+        # Control Buttons
+        control_frame = ttk.LabelFrame(left_panel, text="Controls", padding="10")
+        control_frame.pack(fill=tk.X, pady=(0, 10))
 
-        # Add LLM analysis button
-        # LLM button removed from genomic tab
+        self.start_button = ttk.Button(control_frame, text="Start Processing", command=self.start_processing)
+        self.start_button.pack(fill=tk.X, pady=5)
+        self.stop_button = ttk.Button(control_frame, text="Stop Processing", command=self.stop_processing, state=tk.DISABLED)
+        self.stop_button.pack(fill=tk.X, pady=5)
 
-        # Results display area
-        results_frame = ttk.LabelFrame(main_frame, text="Genomic Analysis Results", padding=10)
-        results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+# Removed duplicate block
 
-        # Text widget for results
-        self.genomic_text = scrolledtext.ScrolledText(results_frame, width=80, height=20)
-        self.genomic_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-    def run_bionemo_analysis(self):
-        """Run BioNemo genomic analysis"""
-        self.genomic_text.delete(1.0, tk.END)
-        self.genomic_text.insert(tk.END, "Running BioNemo genomic analysis...\n")
-        # TODO: Implement actual BioNemo analysis
-        self.genomic_text.insert(tk.END, "Analysis complete. No significant markers found.\n")
+        # Patient Selection / Management
+        patient_frame = ttk.LabelFrame(left_panel, text="Patient Management", padding="10")
+        patient_frame.pack(fill=tk.X, pady=(0, 10))
 
-    def run_llm_analysis(self):
-        """Run LLM-based genomic analysis (Placeholder - likely deprecated by patient tab version)"""
-        # This method might be removed if LLM analysis is only done per patient
-        self.genomic_text.delete(1.0, tk.END)
-        self.genomic_text.insert(tk.END, "Running LLM genomic analysis (Genomic Tab - Placeholder)...\n")
-        # TODO: Implement actual LLM analysis or remove this if superseded
-        self.genomic_text.insert(tk.END, "Analysis complete. No significant findings.\n")
+        ttk.Label(patient_frame, text="Select Patient:").pack(anchor=tk.W)
+        self.patient_listbox = Listbox(patient_frame, height=6, exportselection=False)
+        self.patient_listbox.pack(fill=tk.X, expand=True, pady=(0, 5))
+        self.patient_listbox.bind('<<ListboxSelect>>', self._on_patient_select)
+        self._load_patients_into_listbox() # Populate listbox
 
-    def run_llm_analysis_patient(self):
-        """Run LLM analysis on the currently loaded patient data."""
-        patient_id = self.patient_combo.get().strip()
-        if not patient_id:
-             # Use metrics_text for general UI feedback if possible
-             self.metrics_text.insert(tk.END, "Error: Please load or select a patient first for LLM analysis.\n")
-             return
-        
-        if not self.metrics_history:
-             self.metrics_text.insert(tk.END, f"Error: No metrics data loaded for patient {patient_id} to analyze.\n")
-             return
+        patient_button_frame = ttk.Frame(patient_frame)
+        patient_button_frame.pack(fill=tk.X)
+        ttk.Button(patient_button_frame, text="New", command=self._new_patient).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
+        # Button removed, history is now loaded automatically in the dedicated tab
+        # Add Edit/Delete later if needed
 
-        # Placeholder for LLM analysis based on self.metrics_history
-        print(f"Running LLM analysis for patient {patient_id} with {len(self.metrics_history)} data points...")
-        # Provide feedback in the patient analysis results area or a dedicated LLM output area if added
-        # For now, using metrics_text as a general feedback area
-        self.metrics_text.insert(tk.END, f"Running LLM analysis for patient {patient_id}...\n")
-        # TODO: Implement actual LLM call using self.metrics_history (e.g., summarize trends, risks)
-        # Example: llm_client.analyze(self.metrics_history)
-        time.sleep(1) # Simulate analysis time
-        self.metrics_text.insert(tk.END, f"LLM analysis complete for {patient_id}. Insights: [Placeholder - Check console/log]\n")
-        # TODO: Display LLM results properly in the UI, perhaps in a new text widget on the patient tab
-    def setup_patient_tab(self, parent):
-        """Setup the patient analysis tab"""
-        # Create main frame for the entire tab content
-        tab_main_frame = ttk.Frame(parent, padding=10)
-        tab_main_frame.pack(fill=tk.BOTH, expand=True)
+        # Current Patient Info Display
+        info_frame = ttk.LabelFrame(left_panel, text="Current Patient", padding="10")
+        info_frame.pack(fill=tk.X, pady=(0, 10))
+        self.patient_name_label = ttk.Label(info_frame, text="Name: N/A")
+        self.patient_name_label.pack(anchor=tk.W)
+        self.patient_ethnicity_label = ttk.Label(info_frame, text="Ethnicity: N/A")
+        self.patient_ethnicity_label.pack(anchor=tk.W)
+        # Add more labels (DOB, History) as needed
 
-        # --- Top Frame for Patient Selection/Profile ---
-        top_frame = ttk.Frame(tab_main_frame)
-        top_frame.pack(fill=tk.X, pady=(0, 10))
+        # --- Right Panel (Video Feed, Analysis Tabs) ---
+        right_panel = ttk.Frame(main_frame)
+        right_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Patient Selection/Management Frame (Left side of top_frame)
-        mgmt_frame = ttk.LabelFrame(top_frame, text="Patient Management", padding=10)
-        mgmt_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        # Video Feed Area
+        video_frame = ttk.LabelFrame(right_panel, text="Live Feed", padding="5")
+        video_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10)) # Allow expansion
 
-        # Patient Profile Frame (Right side of top_frame)
-        profile_frame = ttk.LabelFrame(top_frame, text="Patient Profile", padding=10)
-        profile_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+        # Use Canvas for potential drawing over video later
+        self.video_canvas = Canvas(video_frame, bg="black")
+        self.video_canvas.pack(fill=tk.BOTH, expand=True)
+        # Placeholder text until feed starts
+        self.video_placeholder = self.video_canvas.create_text(320, 240, text="Webcam Feed Disconnected", fill="white", font=("Arial", 16))
+        self.video_label_ref = None # To hold the PhotoImage reference
 
-        # --- Populate Management Frame ---
+        # Analysis Tabs
+        self.notebook = ttk.Notebook(right_panel)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        # Patient ID Selection
-        ttk.Label(mgmt_frame, text="Patient ID:").grid(row=0, column=0, padx=(0, 5), pady=5, sticky=tk.W)
-        self.patient_var = tk.StringVar()
-        self.patient_combo = ttk.Combobox(mgmt_frame, textvariable=self.patient_var, width=25) # Wider
-        self.patient_combo.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
-        self._update_patient_list() # Populate dropdown
-        # Bind selection change to load patient? Optional, use Load button for now.
-        # self.patient_combo.bind('<<ComboboxSelected>>', lambda e: self.load_patient())
+        # Tab 1: Eye Metrics
+        eye_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(eye_tab, text="Eye Analysis")
+        # Risk Meter (Canvas)
+        self.risk_meter_canvas = Canvas(eye_tab, width=200, height=50, bg='lightgrey') # Made smaller
+        self.risk_meter_canvas.pack(pady=10)
+        self.risk_meter_ref = None # Reference for risk meter image
+        # Metrics Display (Labels)
+        metrics_frame = ttk.Frame(eye_tab)
+        metrics_frame.pack(fill=tk.X, pady=5)
+        self.metrics_labels = {}
+        metric_keys = ['saccade_velocity', 'fixation_stability', 'blink_rate', 'vertical_saccade_velocity', 'eye_aspect_ratio_left'] # Example keys
+        for key in metric_keys:
+            frame = ttk.Frame(metrics_frame)
+            frame.pack(fill=tk.X)
+            ttk.Label(frame, text=f"{key.replace('_', ' ').title()}:").pack(side=tk.LEFT, padx=5)
+            self.metrics_labels[key] = ttk.Label(frame, text="N/A", width=15, anchor=tk.W)
+            self.metrics_labels[key].pack(side=tk.LEFT)
+        # Add contributing factors display
+        self.factors_label = ttk.Label(eye_tab, text="Contributing Factors: N/A", wraplength=300, justify=tk.LEFT)
+        self.factors_label.pack(pady=5, anchor=tk.W)
 
-        # Ethnicity Selection
-        ttk.Label(mgmt_frame, text="Ethnicity:").grid(row=1, column=0, padx=(0, 5), pady=5, sticky=tk.W)
-        self.ethnicity_var = tk.StringVar(value='chinese') # Default value
-        self.ethnicity_combo = ttk.Combobox(mgmt_frame, textvariable=self.ethnicity_var,
-                                            values=['chinese', 'malay', 'indian', 'other'], width=10, state='readonly')
-        self.ethnicity_combo.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
 
-        # Buttons Frame within Management Frame
-        button_frame_mgmt = ttk.Frame(mgmt_frame)
-        button_frame_mgmt.grid(row=2, column=0, columnspan=2, pady=(10,0))
+        # Tab 2: Genomic Analysis
+        genomic_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(genomic_tab, text="Genomic Simulation")
+        self.genomic_trigger_button = ttk.Button(genomic_tab, text="Run Genomic Simulation", command=self._trigger_genomic_analysis, state=tk.DISABLED)
+        self.genomic_trigger_button.pack(pady=10)
+        self.genomic_results_text = Text(genomic_tab, height=10, width=60, wrap=tk.WORD, state=tk.DISABLED)
+        self.genomic_results_text.pack(fill=tk.BOTH, expand=True)
 
-        self.btn_load = ttk.Button(button_frame_mgmt, text="Load Patient", command=self.load_patient)
-        self.btn_load.pack(side=tk.LEFT, padx=5)
-        
-        # Save button now saves PROFILE data via storage class
-        self.btn_save_profile = ttk.Button(button_frame_mgmt, text="Save Profile", command=self.save_patient_profile) # Renamed command
-        self.btn_save_profile.pack(side=tk.LEFT, padx=5)
+        # Tab 3: LLM Analysis
+        llm_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(llm_tab, text="LLM Summary")
+        self.llm_trigger_button = ttk.Button(llm_tab, text="Get LLM Analysis", command=self._trigger_llm_analysis, state=tk.DISABLED)
+        self.llm_trigger_button.pack(pady=10)
+        self.llm_results_text = Text(llm_tab, height=10, width=60, wrap=tk.WORD, state=tk.DISABLED)
+        self.llm_results_text.pack(fill=tk.BOTH, expand=True)
 
-        # LLM Analysis Button
-        self.btn_run_llm_patient = ttk.Button(button_frame_mgmt, text="Run LLM Analysis",
-                                            command=self.run_llm_analysis_patient)
-        self.btn_run_llm_patient.pack(side=tk.LEFT, padx=5)
+        # Tab 4: Patient History
+        history_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(history_tab, text="Patient History")
 
-        # --- Populate Profile Frame ---
-        ttk.Label(profile_frame, text="Name:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
-        self.patient_name_entry = ttk.Entry(profile_frame, textvariable=self.patient_name_var, width=30) # Correct variable
-        self.patient_name_entry.grid(row=0, column=1, padx=5, pady=2, sticky=tk.EW)
+        history_list_frame = ttk.Frame(history_tab)
+        history_list_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        ttk.Label(history_list_frame, text="Past Sessions:").pack(anchor=tk.W)
+        self.history_listbox = Listbox(history_list_frame, height=15, exportselection=False)
+        history_scrollbar = Scrollbar(history_list_frame, orient=tk.VERTICAL, command=self.history_listbox.yview)
+        self.history_listbox.config(yscrollcommand=history_scrollbar.set)
+        self.history_listbox.pack(side=tk.LEFT, fill=tk.Y)
+        history_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.history_listbox.bind('<<ListboxSelect>>', self._on_session_history_select)
 
-        ttk.Label(profile_frame, text="Age:").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
-        self.patient_age_entry = ttk.Entry(profile_frame, textvariable=self.patient_age_var, width=5)
-        self.patient_age_entry.grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
+        history_detail_frame = ttk.Frame(history_tab)
+        history_detail_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Label(history_detail_frame, text="Session Details:").pack(anchor=tk.W)
+        self.history_detail_text = Text(history_detail_frame, height=15, width=60, wrap=tk.WORD, state=tk.DISABLED)
+        detail_scrollbar = Scrollbar(history_detail_frame, orient=tk.VERTICAL, command=self.history_detail_text.yview)
+        self.history_detail_text.config(yscrollcommand=detail_scrollbar.set)
+        self.history_detail_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        detail_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Add button to trigger LLM for selected history item
+        self.llm_history_button = ttk.Button(history_detail_frame, text="Analyze Selected Session (LLM)", command=lambda: self._trigger_llm_analysis(use_history=True), state=tk.DISABLED)
+        self.llm_history_button.pack(pady=5)
 
-        ttk.Label(profile_frame, text="Gender:").grid(row=1, column=2, padx=5, pady=2, sticky=tk.W)
-        self.patient_gender_combo = ttk.Combobox(profile_frame, textvariable=self.patient_gender_var,
-                                                 values=['Male', 'Female', 'Other'], width=8, state='readonly')
-        self.patient_gender_combo.grid(row=1, column=3, padx=5, pady=2, sticky=tk.W)
+        logging.info("UI setup complete.")
 
-        ttk.Label(profile_frame, text="Medical History:").grid(row=2, column=0, padx=5, pady=2, sticky=tk.NW)
-        self.medical_history_text = scrolledtext.ScrolledText(profile_frame, width=40, height=3, wrap=tk.WORD)
-        self.medical_history_text.grid(row=2, column=1, columnspan=3, padx=5, pady=2, sticky=tk.EW)
+    # --- Patient Management Methods ---
+    def _load_patients_into_listbox(self):
+        """Loads patient names and IDs from storage into the listbox."""
+        self.patient_listbox.delete(0, tk.END)
+        patients = self.storage.list_patients()
+        for patient in patients:
+            self.patient_listbox.insert(tk.END, f"{patient['name']} (ID: {patient['id']})")
+            # Store patient ID along with the display text if needed, e.g., using a dictionary
+            # self.patient_map[f"{patient['name']} (ID: {patient['id']})"] = patient['id']
 
-        # --- Bottom Frame for Analysis Results ---
-        # Results display area (takes remaining space)
-        results_frame = ttk.LabelFrame(tab_main_frame, text="Patient Analysis Results", padding=10)
-        results_frame.pack(fill=tk.BOTH, expand=True, padx=0, pady=0) # No extra padding needed
-
-        # Notebook for different views within results
-        self.patient_notebook = ttk.Notebook(results_frame)
-        self.patient_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5) # Padding inside the frame
-
-        # Metrics tab
-        self.metrics_tab = ttk.Frame(self.patient_notebook)
-        self.patient_notebook.add(self.metrics_tab, text="Metrics History")
-        self.setup_metrics_tab(self.metrics_tab)
-
-        # Risk assessment tab
-        self.risk_tab = ttk.Frame(self.patient_notebook)
-        self.patient_notebook.add(self.risk_tab, text="Risk Assessment")
-        self.setup_risk_tab(self.risk_tab)
-
-    def setup_metrics_tab(self, parent):
-        """Setup metrics history visualization for the patient tab"""
-        self.patient_metrics_canvas = tk.Canvas(parent) # Renamed for clarity
-        self.patient_metrics_canvas.pack(fill=tk.BOTH, expand=True)
-
-    def setup_risk_tab(self, parent):
-        """Setup risk assessment visualization for the patient tab"""
-        self.patient_risk_canvas = tk.Canvas(parent) # Renamed for clarity
-        self.patient_risk_canvas.pack(fill=tk.BOTH, expand=True)
-
-    def load_patient(self):
-        """Load patient profile from DB and metrics history from JSON file."""
-        patient_id = self.patient_combo.get().strip()
-        if not patient_id:
-            self.metrics_text.insert(tk.END, "Error: Please select or enter a Patient ID to load.\n")
+    def _on_patient_select(self, event=None):
+        """Handles selection of a patient from the listbox."""
+        selected_indices = self.patient_listbox.curselection()
+        if not selected_indices:
             return
-
-        # --- Load Patient Profile from DB ---
+        selected_text = self.patient_listbox.get(selected_indices[0])
+        # Extract ID (assuming format "Name (ID: id)")
         try:
-            # Use the new get_patient method
-            patient_profile = self.storage.get_patient(patient_id)
-            if patient_profile:
-                 # TODO: Update UI elements with profile data (name, age, etc.) when they are added
-                 print(f"Loaded profile for {patient_id}: {patient_profile}")
-                 self.metrics_text.insert(tk.END, f"Loaded profile for Patient ID: {patient_id}\n")
-                 # Example: self.patient_name_var.set(patient_profile.get('name', ''))
+            self.current_patient_id = int(selected_text.split("(ID: ")[1].replace(")", ""))
+            self.current_patient_info = self.storage.get_patient(self.current_patient_id)
+            if self.current_patient_info:
+                self.patient_name_label.config(text=f"Name: {self.current_patient_info.get('name', 'N/A')}")
+                self.patient_ethnicity_label.config(text=f"Ethnicity: {self.current_patient_info.get('ethnicity', 'N/A')}")
+                logging.info(f"Selected patient ID: {self.current_patient_id}")
+                # Enable analysis buttons if a patient is selected and processing is active
+                self.genomic_trigger_button.config(state=tk.NORMAL if self.is_processing else tk.DISABLED)
+                self.llm_trigger_button.config(state=tk.NORMAL if self.is_processing else tk.DISABLED) # LLM for live data
+                # Load and display patient's session history
+                self._display_patient_sessions()
+
             else:
-                 self.metrics_text.insert(tk.END, f"No profile found in DB for Patient ID: {patient_id}\n")
-                 # Decide if we should proceed to load session data even without profile
-                 # For now, we'll proceed
+                self._clear_patient_selection()
+        except (IndexError, ValueError) as e:
+            logging.error(f"Error parsing patient ID from listbox: {selected_text} - {e}")
+            self._clear_patient_selection()
 
-        except Exception as e:
-             self.metrics_text.insert(tk.END, f"Error loading profile for {patient_id} from DB: {e}\n")
-             # Decide if we should stop or try loading session data
-
-        # --- Load Metrics History from JSON (as before) ---
-        # Note: This assumes metrics_history is saved separately per patient ID,
-        # matching the save_patient logic. If sessions are saved instead, this needs adjustment.
-        # Construct path relative to the project structure
-        # Construct path relative to the project structure (assuming CWD is PycharmProjects)
-        # Use new path within src/data
-        data_dir = os.path.join("GenomeGuard", "src", "data", "patient")
-        filename = os.path.join(data_dir, f"{patient_id}_data.json")
-
-        if not os.path.exists(filename):
-            self.metrics_text.insert(tk.END, f"No metrics history file found for Patient ID: {patient_id} at {filename}\n")
-            self.metrics_history = [] # Clear history if file not found
-            self.update_patient_views() # Update UI to show no data
-            return
-
-        try:
-            with open(filename, 'r') as f:
-                data = json.load(f)
-            
-            # Load metrics history from the JSON file
-            self.metrics_history = data.get('metrics_history', [])
-            self.metrics_text.insert(tk.END, f"Loaded metrics history for Patient ID: {patient_id} ({len(self.metrics_history)} records)\n")
-            self.update_patient_views() # Update UI with loaded metrics data
-
-        except Exception as e:
-            self.metrics_text.insert(tk.END, f"Error loading metrics history for {patient_id} from {filename}: {e}\n")
-            self.metrics_history = [] # Clear history on error
-            self.update_patient_views() # Update UI
-
-    def save_patient_profile(self): # Renamed method
-        """Saves the patient profile data entered in the UI to the database."""
-        name = self.patient_name_var.get().strip()
-        age_str = self.patient_age_var.get().strip()
-        
-        if not name:
-            messagebox.showwarning("Invalid Data", "Patient name is required.")
-            return
-            
-        try:
-            age = int(age_str) if age_str.isdigit() else 0
-        except ValueError:
-            messagebox.showwarning("Invalid Data", "Age must be a valid number.")
-            return
-
-        # Extract patient ID from combobox (might be "ID - Name" or just ID/Name)
-        # We prioritize saving under the ID part if it exists, otherwise save potentially new patient
-        patient_selection = self.patient_combo.get().strip()
-        # Handle cases where only name is entered or "ID - Name" format is used
-        patient_id_part = None
-        if ' - ' in patient_selection:
-            patient_id_part = patient_selection.split(' - ')[0]
-            # Check if the name part matches the current name field
-            name_part = patient_selection.split(' - ', 1)[1]
-            if name_part != name:
-                # Name changed or new patient based on existing ID format, treat as new/update
-                 patient_id_part = None # Let storage handle ID generation/replacement logic based on name
-        elif patient_selection == name: # Only name entered, likely new patient
-             patient_id_part = None
-        else: # Something else entered, could be just an ID or a new name
-             # If it looks like an existing ID format (e.g., PT12345), use it
-             if patient_selection.startswith("PT") and patient_selection[2:].isdigit():
-                  patient_id_part = patient_selection
-             else: # Treat as potentially new patient name, let storage handle ID
-                  patient_id_part = None
+    def _clear_patient_selection(self):
+        """Resets current patient info."""
+        self.current_patient_id = None
+        self.current_patient_info = {}
+        self.patient_name_label.config(text="Name: N/A")
+        self.patient_ethnicity_label.config(text="Ethnicity: N/A")
+        self.genomic_trigger_button.config(state=tk.DISABLED)
+        self.llm_trigger_button.config(state=tk.DISABLED)
+        self.history_listbox.delete(0, tk.END) # Clear history list
+        self.history_detail_text.config(state=tk.NORMAL)
+        self.history_detail_text.delete('1.0', tk.END)
+        self.history_detail_text.config(state=tk.DISABLED)
+        self.llm_history_button.config(state=tk.DISABLED)
+        self.selected_history_session_id = None
+        self.loaded_history_session_data = None
+        logging.info("Cleared patient selection and history.")
 
 
-        patient_data = {
-            'id': patient_id_part, # Pass potential existing ID or None
-            'name': name,
-            'age': age,
-            'gender': self.patient_gender_var.get(),
-            'medical_history': self.medical_history_text.get(1.0, tk.END).strip() # Get from Text widget
-        }
-        
-        try:
-            # Use storage class to save profile to DB (handles INSERT OR REPLACE)
-            saved_id = self.storage.save_patient(patient_data)
-            
-            # Update UI to reflect saved state
-            new_selection_text = f"{saved_id} - {name}"
-            self.patient_var.set(new_selection_text) # Update combobox display variable
-            self._update_patient_list() # Refresh dropdown list with potentially new/updated entry
-            
-            # Ensure the newly saved/updated patient is selected in the combobox
-            # This might require finding the index if _update_patient_list doesn't preserve selection perfectly
-            if new_selection_text in self.patient_combo['values']:
-                 self.patient_combo.set(new_selection_text)
-            
-            messagebox.showinfo("Patient Saved", f"Patient profile for '{name}' saved successfully with ID: {saved_id}")
-            self.metrics_text.insert(tk.END, f"Saved profile for Patient ID: {saved_id}\n")
-
-        except Exception as e:
-            messagebox.showerror("Save Error", f"Failed to save patient profile: {e}")
-            self.metrics_text.insert(tk.END, f"Error saving profile: {e}\n")
-
-    # Note: Saving metrics_history to JSON is now separate.
-    # Consider adding a "Save Session" button if needed.
-
-        # --- Also Save Metrics History to JSON ---
-        # This saves the current in-memory metrics history when the profile is saved.
-        if self.metrics_history: # Only save if there's history
-            # Construct path relative to project root
-            metrics_data_dir = os.path.join("GenomeGuard", "patient_data")
-            os.makedirs(metrics_data_dir, exist_ok=True)
-            metrics_filename = os.path.join(metrics_data_dir, f"{saved_id}_data.json")
-
-            metrics_to_save = {
-                'patient_id': saved_id,
-                'save_timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
-                'metrics_history': self.metrics_history
-            }
-
-            try:
-                with open(metrics_filename, 'w') as f:
-                    # Use NumpyEncoder from storage.py if metrics contain numpy types
-                    json.dump(metrics_to_save, f, cls=NumpyEncoder, indent=4)
-                self.metrics_text.insert(tk.END, f"Saved current metrics history for {saved_id} to {metrics_filename}\n")
-            except Exception as e:
-                self.metrics_text.insert(tk.END, f"Error saving metrics history for {saved_id}: {e}\n")
+    def _new_patient(self):
+        """Opens dialog to add a new patient."""
+        name = simpledialog.askstring("New Patient", "Enter Patient Name:")
+        if not name: return
+        ethnicity = simpledialog.askstring("New Patient", "Enter Ethnicity (e.g., chinese, malay, indian):")
+        # Add more fields (DOB, medical history) as needed
+        new_id = self.storage.add_patient(name, ethnicity=ethnicity)
+        if new_id:
+            messagebox.showinfo("Success", f"Patient '{name}' added with ID {new_id}.")
+            self._load_patients_into_listbox()
+            # Optionally auto-select the new patient
         else:
-             self.metrics_text.insert(tk.END, f"No current metrics history to save for {saved_id}.\n")
+            messagebox.showerror("Error", "Failed to add patient.")
 
-    # Note: Saving metrics_history to JSON is currently tied to saving the profile.
-    def update_patient_views(self):
-        """Update patient tab visualizations based on loaded metrics_history."""
-        self.patient_metrics_canvas.delete("all")
-        self.patient_risk_canvas.delete("all") # Use the renamed canvas
+    def _display_patient_sessions(self):
+        """Fetches and displays past sessions for the current patient."""
+        self.history_listbox.delete(0, tk.END)
+        self.history_detail_text.config(state=tk.NORMAL)
+        self.history_detail_text.delete('1.0', tk.END)
+        self.history_detail_text.insert(tk.END, "Select a session from the list.")
+        self.history_detail_text.config(state=tk.DISABLED)
+        self.llm_history_button.config(state=tk.DISABLED)
+        self.selected_history_session_id = None
+        self.loaded_history_session_data = None
 
-        if self.metrics_history:
-            try:
-                # Visualize metrics history
-                # Assuming create_metrics_visualization returns a PIL Image
-                metrics_img = create_metrics_visualization(self.metrics_history)
-                # Keep reference to avoid garbage collection
-                self.patient_metrics_vis_imgtk = ImageTk.PhotoImage(image=metrics_img)
-                self.patient_metrics_canvas.create_image(0, 0, anchor=tk.NW, image=self.patient_metrics_vis_imgtk)
-                
-                # TODO: Update risk assessment visualization on patient_risk_canvas based on historical data
-                # Example: Draw a historical risk meter or trend
-                # risk_history = [m.get('risk_level') for m in self.metrics_history if m and 'risk_level' in m]
-                # if risk_history:
-                #    # Use create_risk_meter or another function for historical view
-                #    pass
 
-            except Exception as e:
-                print(f"Error updating patient visualizations: {e}")
-                self.patient_metrics_canvas.create_text(10, 10, anchor=tk.NW, text=f"Error: {e}")
-        else:
-             self.patient_metrics_canvas.create_text(10, 10, anchor=tk.NW, text="No patient data loaded.")
-             self.patient_risk_canvas.create_text(10, 10, anchor=tk.NW, text="No patient data loaded.")
-
-    def toggle_debug(self):
-        """Toggle debug visualization mode"""
-        self.debug_mode = not self.debug_mode
-        self.eye_tracker.debug = self.debug_mode
-        debug_status = "ON" if self.debug_mode else "OFF"
-        self.metrics_text.insert(tk.END, f"Debug mode {debug_status}\n")
-
-    def update_metrics(self, metrics):
-        """Update metrics display and visualizations"""
-        if not isinstance(metrics, dict):
+        if not self.current_patient_id:
             return
-        
-        try:
-            # Update text metrics display
-            self.metrics_text.delete(1.0, tk.END)
-            self.metrics_text.insert(tk.END, "Current Metrics:\n")
-            
-            # Filter out non-serializable/numeric values for display
-            displayable_metrics = {k:v for k,v in metrics.items()
-                                 if isinstance(v, (int, float, str))}
-            for k, v in displayable_metrics.items():
-                self.metrics_text.insert(tk.END, f"{k}: {v}\n")
 
-            # Update eye movement visualization if available
-            if hasattr(self, 'eye_plot'):
-                # Handle missing/None values safely
-                x = metrics.get('gaze_x', 0) or 0
-                y = metrics.get('gaze_y', 0) or 0
-                
-                if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
-                    return
-                
-                self.eye_plot.clear()
-                self.eye_plot.scatter(x, y, color='red', s=100, alpha=0.5)
-                self.eye_plot.set_title("Eye Position")
-                self.eye_plot.set_xlim(0, 1)  # Relative coordinates
-                self.eye_plot.set_ylim(0, 1)
-                self.eye_plot.grid(True)
-                
-                # Draw movement path history
-                if hasattr(self, 'metrics_history'):
-                    xs = [m.get('gaze_x', 0) for m in self.metrics_history[-20:]
-                         if isinstance(m, dict) and isinstance(m.get('gaze_x'), (int, float))]
-                    ys = [m.get('gaze_y', 0) for m in self.metrics_history[-20:]
-                         if isinstance(m, dict) and isinstance(m.get('gaze_y'), (int, float))]
-                    
-                    if xs and ys:
-                        self.eye_plot.plot(xs, ys, '-o', color='blue', alpha=0.3, linewidth=1)
-                
-                self.eye_canvas.draw()
+        sessions = self.storage.get_patient_sessions(self.current_patient_id)
+        if not sessions:
+            self.history_listbox.insert(tk.END, "No past sessions found.")
+            return
+
+        for session in sessions:
+            start_time = session.get('start_time', 'N/A')
+            session_id = session.get('id')
+            risk = session.get('avg_risk_level')
+            risk_str = f"{risk:.3f}" if risk is not None else "N/A"
+            display_text = f"ID: {session_id} | Start: {start_time} | Avg Risk: {risk_str}"
+            self.history_listbox.insert(tk.END, display_text)
+            # Could store session ID mapping if needed, similar to patient list
+
+    def _on_session_history_select(self, event=None):
+        """Handles selection of a session from the history listbox."""
+        selected_indices = self.history_listbox.curselection()
+        if not selected_indices:
+            return
+        selected_text = self.history_listbox.get(selected_indices[0])
+
+        # Extract session ID
+        try:
+            session_id_str = selected_text.split("ID: ")[1].split(" |")[0]
+            self.selected_history_session_id = int(session_id_str)
+            logging.info(f"Selected history session ID: {self.selected_history_session_id}")
+
+            # Load session details from JSON
+            self.loaded_history_session_data = self.storage.get_session_details(self.selected_history_session_id)
+
+            self.history_detail_text.config(state=tk.NORMAL)
+            self.history_detail_text.delete('1.0', tk.END)
+
+            if self.loaded_history_session_data:
+                # Display formatted JSON or summary
+                # Ensure loaded_history_session_data is treated as a list of log entries
+                if isinstance(self.loaded_history_session_data, list):
+                     display_str = f"Session Log ({len(self.loaded_history_session_data)} entries):\n"
+                     # Display first few entries as example, or summary stats
+                     for i, entry in enumerate(self.loaded_history_session_data[:5]): # Show first 5
+                         ts = time.strftime('%H:%M:%S', time.localtime(entry.get('timestamp', 0)))
+                         risk = entry.get('risk_results', [None])[0]
+                         risk_str = f"{risk:.3f}" if risk is not None else "N/A"
+                         display_str += f"- {ts}: Risk={risk_str}\n"
+                     if len(self.loaded_history_session_data) > 5:
+                         display_str += f"... ({len(self.loaded_history_session_data) - 5} more entries)"
+                else:
+                    # Fallback if data is not a list (e.g., older format?)
+                    display_str = json.dumps(self.loaded_history_session_data, indent=2, cls=self.storage.NumpyEncoder)
+
+                self.history_detail_text.insert(tk.END, display_str)
+                self.llm_history_button.config(state=tk.NORMAL) # Enable LLM analysis for this session
+            else:
+                self.history_detail_text.insert(tk.END, f"Could not load details for session {self.selected_history_session_id}.")
+                self.llm_history_button.config(state=tk.DISABLED)
+
+            self.history_detail_text.config(state=tk.DISABLED)
+
+        except (IndexError, ValueError, TypeError) as e:
+            logging.error(f"Error parsing session ID or loading details: {selected_text} - {e}", exc_info=True)
+            self.history_detail_text.config(state=tk.NORMAL)
+            self.history_detail_text.delete('1.0', tk.END)
+            self.history_detail_text.insert(tk.END, "Error loading session details.")
+            self.history_detail_text.config(state=tk.DISABLED)
+            self.llm_history_button.config(state=tk.DISABLED)
+            self.selected_history_session_id = None
+            self.loaded_history_session_data = None
+
+    # --- Mode Control Callbacks ---
+    def _toggle_debug_mode(self):
+        """Callback for the debug mode checkbutton."""
+        is_debug = self.debug_mode_var.get()
+        self.eye_tracker.set_debug_mode(is_debug)
+        logging.info(f"Debug mode set to: {is_debug}")
+
+    def _set_eye_processing_mode(self):
+        """Callback for the eye processing mode radio buttons."""
+        mode = self.eye_mode_var.get()
+        self.eye_tracker.set_eye_processing_mode(mode)
+        logging.info(f"Eye processing mode set to: {mode}")
+        # Optionally clear metrics display when mode changes?
+        for label in self.metrics_labels.values():
+            label.config(text="N/A")
+        self.factors_label.config(text="Contributing Factors: N/A")
+        if self.risk_meter_canvas.winfo_exists():
+             self.risk_meter_canvas.delete("all")
+             self.risk_meter_canvas.create_text(100, 25, text="Risk: N/A", fill="black")
+    # --- Processing Control ---
+    def start_processing(self):
+        """Starts the camera capture and processing threads."""
+        if self.is_processing:
+            logging.warning("Processing already running.")
+            return
+
+        logging.info("Starting processing...")
+        try:
+            # Initialize camera stream here to ensure it's fresh
+            self.camera_stream = RTSPCameraStream(src=0).start()
+            time.sleep(1.0) # Give camera time to initialize
+
+            # Start a new session in the database
+            self.current_session_id = self.storage.start_session(self.current_patient_id)
+            self.session_data_log = [] # Reset log for new session
+            self.last_risk_level = None # Reset state
+            self.last_eye_metrics_raw = None
+            self.last_eye_metrics_summary = None
+            self.last_genomic_result = None
+
+
+            # Initialize and start processing thread
+            self.processing_thread = ProcessingThread(
+                self.camera_stream,
+                self.processing_result_queue,
+                self.eye_tracker,
+                self.pd_detector
+            )
+            self.processing_thread.start()
+
+            # Initialize and start genomic thread (it will wait for input)
+            self.genomic_thread = GenomicAnalysisThread(
+                self.genomic_input_queue,
+                self.genomic_output_queue,
+                self.bionemo_client
+            )
+            self.genomic_thread.start()
+
+
+            self.is_processing = True
+            self.start_button.config(state=tk.DISABLED)
+            self.stop_button.config(state=tk.NORMAL)
+            if self.current_patient_id: # Enable analysis buttons only if patient selected
+                 self.genomic_trigger_button.config(state=tk.NORMAL)
+                 self.llm_trigger_button.config(state=tk.NORMAL)
+
+            # Start checking the queue for results
+            self._check_queues()
+            logging.info("Processing started.")
 
         except Exception as e:
-            print(f"Error updating metrics display: {str(e)}")
-            self.metrics_text.insert(tk.END, f"\nDisplay error: {str(e)}\n")
-        """Update metrics display and visualizations"""
-        if not isinstance(metrics, dict):
-            print(f"Warning: Unexpected metrics type received: {type(metrics)}. Expected dict.")
+            logging.error(f"Error starting processing: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Failed to start processing:\n{e}")
+            # Clean up if partial start occurred
+            if self.camera_stream: self.camera_stream.stop()
+            if self.processing_thread and self.processing_thread.is_alive(): self.processing_thread.stop()
+            if self.genomic_thread and self.genomic_thread.is_alive(): self.genomic_thread.stop()
+            self.is_processing = False
+
+
+    def stop_processing(self):
+        """Stops the processing threads and resets for clean restart."""
+        if not self.is_processing:
+            logging.warning("Processing not running.")
             return
 
-        # Update text metrics display
-        self.metrics_text.delete(1.0, tk.END)
-        self.metrics_text.insert(tk.END, "Current Metrics:\n")
-        for k, v in metrics.items():
-            self.metrics_text.insert(tk.END, f"{k}: {v}\n")
+        logging.info("Stopping processing...")
+        self.is_processing = False # Signal queue checker to stop requesting frames
 
-        # Update eye movement visualization if available
-        if hasattr(self, 'eye_plot'):
-            x = metrics.get('gaze_x', 0)
-            y = metrics.get('gaze_y', 0)
-            
-            self.eye_plot.clear()
-            self.eye_plot.scatter(x, y, color='red', s=100, alpha=0.5)
-            self.eye_plot.set_title("Eye Movement Tracking")
-            self.eye_plot.set_xlim(-1, 1)  # Normalized coordinates
-            self.eye_plot.set_ylim(-1, 1)
-            self.eye_plot.grid(True)
-            
-            # Draw movement path from history
-            if hasattr(self, 'metrics_history'):
-                xs = [m.get('gaze_x', 0) for m in self.metrics_history[-100:] if isinstance(m, dict)]
-                ys = [m.get('gaze_y', 0) for m in self.metrics_history[-100:] if isinstance(m, dict)]
-                if xs and ys:
-                    self.eye_plot.plot(xs, ys, '-o', color='blue', alpha=0.3, linewidth=1)
-            
-            self.eye_canvas.draw()
-        """Update metrics display with mode-specific information"""
-        self.metrics_text.delete(1.0, tk.END)
+        # Clear any pending frames in queues
+        self._clear_queues()
 
-        # Safeguard: Check if metrics is actually a dictionary
-        if not isinstance(metrics, dict):
-            error_msg = f"Error: update_metrics received type {type(metrics)}, expected dict. Value: {metrics}"
-            print(error_msg)
-            self.metrics_text.insert(tk.END, error_msg + "\n")
-            # Attempt to use default values or return early
-            metrics = {} # Use empty dict to prevent further errors in this method
-            # return # Or simply return if preferred
-        
+        # Stop threads gracefully
+        if self.genomic_thread and self.genomic_thread.is_alive():
+            self.genomic_thread.stop()
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.processing_thread.reset() # Reset with fresh resources
+
+        # Reset camera stream if exists
+        if hasattr(self, 'camera_stream'):
+            self.camera_stream.stop()
+        if self.camera_stream:
+            self.camera_stream.stop()
+
+        # Wait for threads to finish (optional, but good practice)
+        # Add timeouts
+        if self.processing_thread and self.processing_thread.is_alive(): self.processing_thread.join(timeout=2)
+        if self.genomic_thread and self.genomic_thread.is_alive(): self.genomic_thread.join(timeout=2)
+
+
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.genomic_trigger_button.config(state=tk.DISABLED)
+        self.llm_trigger_button.config(state=tk.DISABLED)
+
+        # End the session in the database and save detailed log
+        if self.current_session_id:
+            avg_risk = np.mean([item['risk_results'][0] for item in self.session_data_log if item.get('risk_results')]) if self.session_data_log else None
+            json_filename = self.storage.save_session_details(self.current_session_id, self.session_data_log)
+            self.storage.end_session(self.current_session_id, avg_risk_level=avg_risk, json_log_filename=json_filename)
+            logging.info(f"Session {self.current_session_id} ended and saved.")
+            self.current_session_id = None
+
+    def _clear_queues(self):
+        """Clears all processing queues to prepare for restart."""
+        try:
+            while not self.processing_result_queue.empty():
+                self.processing_result_queue.get_nowait()
+            while not self.genomic_input_queue.empty():
+                self.genomic_input_queue.get_nowait()
+            while not self.genomic_output_queue.empty():
+                self.genomic_output_queue.get_nowait()
+            logging.info("Cleared all processing queues")
+        except queue.Empty:
+            pass
+        except Exception as e:
+            logging.warning(f"Error clearing queues: {e}")
+
+        # Clear video display
+        if self.video_label_ref:
+             self.video_canvas.delete("all") # Clear previous image/text
+             # Check if canvas exists before creating text
+             if self.video_canvas.winfo_exists():
+                 canvas_w = self.video_canvas.winfo_width()
+                 canvas_h = self.video_canvas.winfo_height()
+                 self.video_placeholder = self.video_canvas.create_text(canvas_w//2 if canvas_w > 0 else 320,
+                                                                        canvas_h//2 if canvas_h > 0 else 240,
+                                                                        text="Webcam Feed Disconnected", fill="white", font=("Arial", 16))
+             self.video_label_ref = None
+
+
+        logging.info("Processing stopped.")
+
+
+    # --- Queue Handling and UI Updates ---
+    def _check_queues(self):
+        """Periodically checks result queues and schedules UI updates."""
+        # Check processing queue
+        try:
+            while True: # Process all available items
+                result = self.processing_result_queue.get_nowait()
+                self._update_display(result)
+                # Log data for session saving
+                if self.current_session_id:
+                    # Add timestamp for logging
+                    result['timestamp'] = time.time()
+                    # Store only necessary parts if result is large
+                    log_entry = {
+                        'timestamp': result['timestamp'],
+                        'raw_metrics': result.get('raw_metrics'),
+                        'risk_results': result.get('risk_results')
+                        # Avoid storing full frames in the log
+                    }
+                    self.session_data_log.append(log_entry)
+
+        except queue.Empty:
+            pass # No new processing results
+
+        # Check genomic analysis output queue
+        try:
+            while True:
+                genomic_result = self.genomic_output_queue.get_nowait()
+                self.last_genomic_result = genomic_result # Store latest result
+                self._update_genomic_display(genomic_result)
+        except queue.Empty:
+            pass # No new genomic results
+
+        # Reschedule check if processing is still active
+        if self.is_processing:
+            self.root.after(50, self._check_queues) # Check again in 50ms
+
+    def _convert_frame_to_tk(self, frame):
+        """Converts an OpenCV frame (BGR) to a Tkinter PhotoImage."""
+        if frame is None:
+            return None
+        try:
+            # Ensure frame is in RGB format for PIL
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Resize frame to fit canvas if necessary (optional)
+            # target_w, target_h = 640, 480 # Example target size
+            # frame_rgb = cv2.resize(frame_rgb, (target_w, target_h))
+
+            img = Image.fromarray(frame_rgb)
+            imgtk = ImageTk.PhotoImage(image=img)
+            return imgtk
+        except Exception as e:
+            logging.error(f"Error converting frame to Tkinter format: {e}")
+            return None
+
+    def _update_display(self, result_data):
+        """Updates the UI with data from the processing thread. Runs in MainThread."""
+        processed_frame = result_data.get('processed_frame')
+        metrics = result_data.get('raw_metrics')
+        risk_results = result_data.get('risk_results') # Tuple (risk_level, factors)
+
+        # Store latest results for potential use by analysis triggers
+        self.last_eye_metrics_raw = metrics
+        self.last_eye_metrics_summary = {'risk_level': risk_results[0] if risk_results else None,
+                                         'contributing_factors': risk_results[1] if risk_results else {}}
+        if risk_results:
+            self.last_risk_level = risk_results[0]
+
+
+        # --- Update Video Feed ---
+        imgtk = self._convert_frame_to_tk(processed_frame)
+        if imgtk and self.video_canvas.winfo_exists():
+            self.video_label_ref = imgtk # Keep reference!
+            self.video_canvas.delete("all") # Clear previous image/text
+            # Calculate position to center image if smaller than canvas
+            canvas_w = self.video_canvas.winfo_width()
+            canvas_h = self.video_canvas.winfo_height()
+            img_x = (canvas_w - imgtk.width()) // 2 if canvas_w > 0 else 0
+            img_y = (canvas_h - imgtk.height()) // 2 if canvas_h > 0 else 0
+            self.video_canvas.create_image(img_x, img_y, anchor=tk.NW, image=imgtk)
+        elif self.video_placeholder is None and self.video_canvas.winfo_exists(): # Only recreate placeholder if it doesn't exist
+             self.video_canvas.delete("all")
+             canvas_w = self.video_canvas.winfo_width()
+             canvas_h = self.video_canvas.winfo_height()
+             self.video_placeholder = self.video_canvas.create_text(canvas_w//2 if canvas_w > 0 else 320,
+                                                                    canvas_h//2 if canvas_h > 0 else 240,
+                                                                    text="Error displaying frame", fill="red", font=("Arial", 16))
+
+
+        # --- Update Metrics ---
         if metrics:
-            # Add mode information
-            self.metrics_text.insert(tk.END, f"Tracking Mode: {metrics.get('mode', 'unknown').upper()}\n\n")
-            
-            # Add iris offset if in eye mode
-            if metrics.get('mode') == 'eye' and 'iris_offset_x' in metrics and 'iris_offset_y' in metrics:
-                self.metrics_text.insert(tk.END, 
-                    f"Iris Offset - X: {metrics['iris_offset_x']:.2f}, Y: {metrics['iris_offset_y']:.2f}\n\n")
-            
-            # Add standard metrics
-            for key, value in metrics.items():
-                if key not in ['mode', 'iris_offset_x', 'iris_offset_y']:
-                    if isinstance(value, (int, float)):
-                        self.metrics_text.insert(tk.END, f"{key}: {value:.4f}\n")
-                    else:
-                        self.metrics_text.insert(tk.END, f"{key}: {value}\n")
-            
-            # Update risk assessment in real-time if not in cycle mode
-            if not self.cycle_var.get():
-                 ethnicity = self.ethnicity_var.get() if hasattr(self, 'ethnicity_var') else 'chinese' # Get selected ethnicity
-                 self.update_risk_assessment(metrics, ethnicity)
+            for key, label in self.metrics_labels.items():
+                value = metrics.get(key)
+                if value is not None:
+                    label.config(text=f"{value:.3f}" if isinstance(value, float) else str(value))
+                else:
+                    label.config(text="N/A")
 
-    def close(self):
-        """Cleanup resources and close the application."""
-        print("Closing application...")
-        if self.running:
-            self.on_stop() # Stop camera feed and processing
-        
-        # Explicitly release camera if on_stop didn't (e.g., if error occurred before stop)
-        if self.cap and self.cap.isOpened():
-            self.cap.release()
-            print("Camera released.")
-            
-        self.window.destroy()
-        print("Window destroyed.")
+        # --- Update Risk Meter & Factors ---
+        if risk_results:
+            risk_level, factors = risk_results
+            # Update meter visualization
+            risk_meter_img = visualization.create_risk_meter(risk_level, width=200, height=50) # Smaller meter
+            risk_meter_tk = self._convert_frame_to_tk(risk_meter_img)
+            if risk_meter_tk and self.risk_meter_canvas.winfo_exists():
+                self.risk_meter_ref = risk_meter_tk # Keep reference
+                self.risk_meter_canvas.delete("all")
+                self.risk_meter_canvas.config(width=risk_meter_tk.width(), height=risk_meter_tk.height())
+                self.risk_meter_canvas.create_image(0, 0, anchor=tk.NW, image=risk_meter_tk)
 
-    def _update_patient_list(self):
-        """Scans the patient_data directory and updates the patient combobox."""
-        data_dir = "patient_data"
-        try:
-            if not os.path.exists(data_dir):
-                self.patient_combo['values'] = []
-                return
+            # Update factors text
+            factors_text = "Contributing Factors:\n" + "\n".join([f"- {k}: {v:.3f}" for k, v in factors.items()])
+            self.factors_label.config(text=factors_text)
+        elif self.risk_meter_canvas.winfo_exists():
+             # Clear risk meter if no results
+             self.risk_meter_canvas.delete("all")
+             self.risk_meter_canvas.create_text(100, 25, text="Risk: N/A", fill="black")
+             self.factors_label.config(text="Contributing Factors: N/A")
 
-            patient_files = [f for f in os.listdir(data_dir) if f.endswith("_data.json")]
-            patient_ids = sorted([f.replace("_data.json", "") for f in patient_files])
-            
-            current_value = self.patient_var.get() # Preserve selection if possible
-            self.patient_combo['values'] = patient_ids
-            if current_value in patient_ids:
-                 self.patient_var.set(current_value)
-            elif patient_ids:
-                 self.patient_var.set(patient_ids[0]) # Select first if current is invalid
+
+    def _update_genomic_display(self, genomic_result):
+        """Updates the Genomic Analysis tab with results."""
+        self.genomic_results_text.config(state=tk.NORMAL)
+        self.genomic_results_text.delete('1.0', tk.END)
+        if isinstance(genomic_result, dict) and 'error' in genomic_result:
+             self.genomic_results_text.insert(tk.END, f"Error: {genomic_result['error']}")
+        elif isinstance(genomic_result, dict):
+             # Pretty print the dictionary result
+             formatted_result = json.dumps(genomic_result, indent=4)
+             self.genomic_results_text.insert(tk.END, formatted_result)
+        else:
+             self.genomic_results_text.insert(tk.END, str(genomic_result)) # Fallback
+        self.genomic_results_text.config(state=tk.DISABLED)
+        logging.info("Updated genomic display.")
+        # Re-enable genomic button after completion (or handle errors)
+        if self.is_processing and self.current_patient_id:
+             self.genomic_trigger_button.config(state=tk.NORMAL)
+
+
+    def _update_llm_display(self, llm_result, target_widget, target_button):
+        """
+        Updates the specified Text widget with LLM results and re-enables the
+        corresponding button based on current state.
+        """
+        target_widget.config(state=tk.NORMAL)
+        target_widget.delete('1.0', tk.END)
+        target_widget.insert(tk.END, llm_result)
+        target_widget.config(state=tk.DISABLED)
+        logging.info("Updated LLM display.")
+
+        # Re-enable the specific button that triggered the analysis, checking state
+        if target_button:
+            should_enable = False
+            if target_button == self.llm_trigger_button:
+                # Enable live button only if processing and patient selected
+                if self.is_processing and self.current_patient_id:
+                    should_enable = True
+            elif target_button == self.llm_history_button:
+                 # Enable history button only if a valid history session is selected
+                 if self.selected_history_session_id:
+                     should_enable = True
+
+            if should_enable:
+                target_button.config(state=tk.NORMAL)
             else:
-                 self.patient_var.set("") # Clear if no patients
+                 # Ensure button remains disabled if conditions aren't met
+                 # (e.g., processing stopped while LLM was running for live analysis)
+                 target_button.config(state=tk.DISABLED)
 
-        except Exception as e:
-            print(f"Error updating patient list: {e}")
-            self.patient_combo['values'] = []
+
+    # --- Analysis Triggers ---
+    def _trigger_genomic_analysis(self):
+        """Sends data to the genomic analysis thread."""
+        if not self.is_processing:
+            messagebox.showwarning("Not Processing", "Start processing before running genomic analysis.")
+            return
+        if not self.current_patient_id:
+             messagebox.showwarning("No Patient", "Select a patient before running genomic analysis.")
+             return
+
+        # Use the stored last risk level
+        if self.last_risk_level is None:
+             messagebox.showerror("Error", "No eye risk score calculated yet.")
+             return
+
+        ethnicity = self.current_patient_info.get('ethnicity', 'default')
+        if not ethnicity: # Handle case where ethnicity might be None or empty string
+            ethnicity = 'default'
+            logging.warning("Patient ethnicity not set, using 'default' for genomic analysis.")
+
+
+        logging.info(f"Queueing genomic analysis for patient {self.current_patient_id}, ethnicity {ethnicity}, risk {self.last_risk_level:.3f}")
+        self.genomic_input_queue.put({'eye_risk_level': self.last_risk_level, 'ethnicity': ethnicity})
+        self.genomic_trigger_button.config(state=tk.DISABLED) # Disable button while running
+        # Clear previous results
+        self.genomic_results_text.config(state=tk.NORMAL)
+        self.genomic_results_text.delete('1.0', tk.END)
+        self.genomic_results_text.insert(tk.END, "Running genomic simulation...")
+        self.genomic_results_text.config(state=tk.DISABLED)
+
+
+    def _trigger_llm_analysis(self, use_history=False):
+        """
+        Triggers analysis by the OpenRouter LLM for either the live data
+        or a selected historical session.
+
+        Args:
+            use_history (bool): If True, use data from the selected historical session.
+                                Otherwise, use the latest live data.
+        """
+        target_button = self.llm_history_button if use_history else self.llm_trigger_button
+        target_text_widget = self.llm_results_text # Could have separate text widgets if desired
+
+        if use_history:
+            if not self.selected_history_session_id or not self.loaded_history_session_data:
+                 messagebox.showwarning("No History Selected", "Select a session from the history list first.")
+                 return
+            if not self.current_patient_id: # Should be set if history is loaded, but double-check
+                 messagebox.showwarning("No Patient", "Select the corresponding patient.")
+                 return
+        else: # Live analysis
+            if not self.is_processing:
+                messagebox.showwarning("Not Processing", "Start processing before running live LLM analysis.")
+                return
+            if not self.current_patient_id:
+                 messagebox.showwarning("No Patient", "Select a patient before running live LLM analysis.")
+                 return
+
+        if not self.openrouter_client.api_key:
+             messagebox.showerror("API Key Missing", "OpenRouter API key not configured.")
+             return
+
+        # --- Gather necessary data based on mode ---
+        patient_data = self.current_patient_info
+        eye_summary_data = None
+        eye_raw_data = None
+        # Use last known live genomic result for both live and history analysis for now
+        # A more advanced implementation might store genomic snapshots with sessions.
+        genomic_data = self.last_genomic_result if self.last_genomic_result else {'error': 'Genomic analysis not run or failed'}
+
+        if use_history:
+            logging.info(f"Gathering data for LLM analysis from historical session ID: {self.selected_history_session_id}")
+            if not isinstance(self.loaded_history_session_data, list) or not self.loaded_history_session_data:
+                 messagebox.showerror("Error", "Loaded historical session data is invalid or empty.")
+                 target_button.config(state=tk.NORMAL) # Re-enable button
+                 return
+
+            # --- Calculate representative data from history log ---
+            valid_entries = [e for e in self.loaded_history_session_data if e.get('raw_metrics') and e.get('risk_results')]
+            if not valid_entries:
+                 messagebox.showwarning("Missing Data", "No valid metric entries found in the selected historical session log.")
+                 target_button.config(state=tk.NORMAL) # Re-enable button
+                 return
+
+            # Example: Calculate averages
+            risk_values = [e['risk_results'][0] for e in valid_entries if e.get('risk_results') and e['risk_results'][0] is not None]
+            avg_risk = np.mean(risk_values) if risk_values else None
+
+            # Average raw metrics (handle potential None values)
+            # Use keys from the first valid entry's raw_metrics if available
+            avg_raw_metrics = {}
+            if valid_entries[0].get('raw_metrics'):
+                raw_metric_keys = valid_entries[0]['raw_metrics'].keys()
+                for key in raw_metric_keys:
+                    values = [e['raw_metrics'].get(key) for e in valid_entries if e.get('raw_metrics') and e['raw_metrics'].get(key) is not None]
+                    if values and isinstance(values[0], (int, float)): # Only average numeric types
+                        avg_raw_metrics[key] = np.mean(values)
+                    elif values: # Keep last known non-numeric value (like 'active_eye_mode')
+                        avg_raw_metrics[key] = values[-1]
+                    else:
+                        avg_raw_metrics[key] = None # Or 'N/A'
+
+            # Factors are harder to average meaningfully, maybe take factors from highest risk entry?
+            # For simplicity, just note that factors are not averaged.
+            eye_summary_data = {'risk_level': avg_risk if avg_risk is not None and not np.isnan(avg_risk) else None,
+                                'contributing_factors': {'Note': 'Factors not averaged from history'}}
+            eye_raw_data = avg_raw_metrics
+
+        else: # Use live data
+            logging.info("Gathering latest live data for LLM analysis.")
+            if not self.last_eye_metrics_summary or not self.last_eye_metrics_raw:
+                messagebox.showwarning("Missing Data", "Live eye tracking data not available yet for LLM analysis.")
+                # Don't re-enable button here, let the calling context handle it if needed
+                return
+            eye_summary_data = self.last_eye_metrics_summary
+            eye_raw_data = self.last_eye_metrics_raw
+
+        # Check if essential eye data was gathered successfully
+        if eye_summary_data is None or eye_raw_data is None:
+             messagebox.showerror("Error", "Could not gather necessary eye data for LLM analysis.")
+             target_button.config(state=tk.NORMAL) # Re-enable button as the process failed early
+             return
+
+        # --- Trigger LLM ---
+        logging.info(f"Triggering LLM analysis for patient {self.current_patient_id} (History: {use_history})")
+        target_button.config(state=tk.DISABLED) # Disable the correct button
+        target_text_widget.config(state=tk.NORMAL)
+        target_text_widget.delete('1.0', tk.END)
+        target_text_widget.insert(tk.END, "Requesting LLM analysis...")
+        target_text_widget.config(state=tk.DISABLED)
+
+        # Run LLM call in a separate thread to avoid blocking GUI
+        def llm_task():
+            analysis = self.openrouter_client.analyze_combined_data(
+                eye_metrics_summary=eye_summary_data,
+                eye_metrics_raw=eye_raw_data,
+                genomic_results=genomic_data, # Use the potentially updated genomic_data
+                patient_info=patient_data
+            )
+            # Schedule UI update back in the main thread
+            # Pass the target widget and button to re-enable
+            self.root.after(0, self._update_llm_display, analysis, target_text_widget, target_button)
+
+        llm_thread = threading.Thread(target=llm_task, daemon=True)
+        llm_thread.start()
+
+
+    # --- Window Closing ---
+    def _on_close(self):
+        """Handles window closing event."""
+        logging.info("Close button clicked.")
+        if self.is_processing:
+            if messagebox.askokcancel("Quit", "Processing is active. Stop processing and quit?"):
+                self.stop_processing()
+                # Wait a moment for threads to potentially signal stop
+                time.sleep(0.5)
+                self.root.destroy()
+            else:
+                return # Don't close if user cancels
+        else:
+             # Ensure DB connection for main thread is closed if open
+             self.storage.close_connection()
+             self.root.destroy()
+
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = Dashboard(root)
+    root.mainloop()
