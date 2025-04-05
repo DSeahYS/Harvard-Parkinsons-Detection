@@ -1,216 +1,185 @@
-# src/llm/openrouter_client.py
 import os
-import requests
-import json
-import time
+import logging
+import requests # Add 'requests' to requirements.txt if not already there
+# from dotenv import load_dotenv
+
+# load_dotenv() # Load .env file if using one
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Default Prompt Template ---
+DEFAULT_PROMPT_TEMPLATE = """
+Analyze the following patient data for potential Parkinson's Disease (PD) risk indicators.
+Combine the eye-tracking metrics and simulated genomic factors to provide a concise summary (2-3 sentences)
+highlighting key risk contributors and potential implications. Be cautious and avoid definitive diagnoses.
+
+Patient Information:
+- Ethnicity: {ethnicity}
+- Age (if available): {age}
+- Relevant Medical History: {medical_history}
+
+Eye-Tracking Metrics Summary:
+- PD Risk Score (0-1): {eye_risk_level:.3f}
+- Key Contributing Eye Factors: {eye_factors}
+- Blink Rate (bpm): {blink_rate:.1f}
+- Fixation Stability Score: {fixation_stability:.3f}
+- Saccade Velocity (deg/s): {saccade_velocity:.1f}
+
+Simulated Genomic Analysis:
+- Profile: {genomic_profile}
+- Combined Genetic Risk Score (0-1): {combined_genetic_risk:.3f}
+- Simulated LRRK2 Risk: {lrrk2_risk:.3f}
+- Simulated GBA Risk: {gba_risk:.3f}
+- Ethnicity Adjustment Factor Applied: {ethnicity_adj_factor:.2f}
+
+Analysis:
+"""
 
 class OpenRouterClient:
-    """Client for accessing DeepSeek V3 via OpenRouter API"""
+    """
+    Client for interacting with the OpenRouter API to get LLM analysis.
+    """
+    def __init__(self, api_key=None, model="openai/gpt-3.5-turbo"):
+        """
+        Initializes the OpenRouter client.
 
-    def __init__(self, api_key=None):
-        """Initialize with API key from parameter or environment variable"""
-        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        Args:
+            api_key (str, optional): OpenRouter API key. Defaults to OPENROUTER_API_KEY env var.
+            model (str): The specific LLM model to use via OpenRouter.
+        """
+        self.api_key = api_key or os.getenv('OPENROUTER_API_KEY')
+        self.model = model
+        self.api_url = "https://openrouter.ai/api/v1/chat/completions"
+
         if not self.api_key:
-            print("Warning: No OpenRouter API key found. Will use mock analysis.")
-        self.base_url = "https://openrouter.ai/api/v1"
-        # Using the specific free model mentioned
-        self.model = "deepseek/deepseek-chat:free" 
+            logging.warning("OpenRouter API key not found. LLM analysis will be disabled.")
+        else:
+            logging.info(f"OpenRouter client initialized for model '{self.model}'.")
 
-    def analyze_patient(self, patient_data, eye_metrics, genomic_data=None):
-        """Generate clinical analysis using DeepSeek V3"""
-        if not self.api_key:
-            print("OpenRouter API key not provided. Generating mock analysis.")
-            return self._generate_mock_analysis(patient_data, eye_metrics, genomic_data)
-
-        # Format the prompt for clinical analysis
-        prompt = self._format_prompt(patient_data, eye_metrics, genomic_data)
-
+    def _format_prompt(self, template, data):
+        """Formats the prompt using the provided template and data."""
+        # Prepare data with defaults for missing keys to avoid errors
+        prompt_data = {
+            'ethnicity': data.get('patient_info', {}).get('ethnicity', 'N/A'),
+            'age': data.get('patient_info', {}).get('age', 'N/A'), # Assuming age might be added
+            'medical_history': data.get('patient_info', {}).get('medical_history', 'N/A'),
+            'eye_risk_level': data.get('eye_metrics_summary', {}).get('risk_level', 0.0),
+            'eye_factors': str(data.get('eye_metrics_summary', {}).get('contributing_factors', {})),
+            'blink_rate': data.get('eye_metrics_raw', {}).get('blink_rate', 0.0),
+            'fixation_stability': data.get('eye_metrics_raw', {}).get('fixation_stability', 0.0),
+            'saccade_velocity': data.get('eye_metrics_raw', {}).get('saccade_velocity', 0.0),
+            'genomic_profile': data.get('genomic_results', {}).get('variant_profile', 'N/A'),
+            'combined_genetic_risk': data.get('genomic_results', {}).get('combined_genetic_risk', 0.0),
+            'lrrk2_risk': data.get('genomic_results', {}).get('simulated_lrrk2_risk', 0.0),
+            'gba_risk': data.get('genomic_results', {}).get('simulated_gba_risk', 0.0),
+            'ethnicity_adj_factor': data.get('genomic_results', {}).get('ethnicity_adjustment_factor', 1.0),
+        }
         try:
-            # Setup headers
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "HTTP-Referer": "GenomicGuard-PD-Detection",  # Recommended for OpenRouter
-                "X-Title": "GenomicGuard",                    # Recommended for OpenRouter
-                "Content-Type": "application/json"
-            }
-
-            # Prepare request payload
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": "You are a neurological diagnostic assistant specializing in Parkinson's disease detection. You analyze ocular biomarkers and genetic information to provide clinical assessments."},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.3 # Recommended temperature for DeepSeek
-            }
-
-            # Make API call
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=60 # Add a timeout
-            )
-
-            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-
-            result = response.json()
-            if "choices" in result and len(result["choices"]) > 0:
-                 # Check if message content exists
-                message_content = result["choices"][0].get("message", {}).get("content")
-                if message_content:
-                    return {
-                        "analysis": message_content,
-                        "model_used": result.get("model", self.model), # Use model from response if available
-                        "success": True
-                    }
-                else:
-                    print("Error: LLM response missing message content.")
-                    return self._generate_error_analysis("LLM response format error (missing content)")
-            else:
-                print(f"Error: Unexpected response format from OpenRouter: {result}")
-                return self._generate_error_analysis("Unexpected LLM response format")
-
-
-        except requests.exceptions.RequestException as e:
-            print(f"Error calling OpenRouter API: {e}")
-            # Fall back to mock analysis on network/API errors
-            return self._generate_mock_analysis(patient_data, eye_metrics, genomic_data)
+            return template.format(**prompt_data)
+        except KeyError as e:
+            logging.error(f"Missing key in prompt data: {e}")
+            return f"Error: Missing data for prompt key {e}"
         except Exception as e:
-            print(f"An unexpected error occurred during LLM analysis: {e}")
-            return self._generate_error_analysis(f"Unexpected error: {e}")
-
-    def _format_prompt(self, patient_data, eye_metrics, genomic_data):
-        """Format clinical data for LLM analysis"""
-        # Create a comprehensive prompt with all available data
-        prompt = f"""
-# Patient Clinical Assessment Request
-
-## Patient Information
-- Name: {patient_data.get('name', 'Anonymous')}
-- Age: {patient_data.get('age', 'Unknown')}
-- Sex: {patient_data.get('sex', 'Unknown')}
-- Medical History: {patient_data.get('medical_history', 'None provided')}
-
-## Ocular Biomarkers (Primary Diagnostic Data)
-- Fixation Stability: {eye_metrics.get('fixation_stability', 'N/A')} (Normal range: <0.3)
-- Saccade Velocity (Avg): {eye_metrics.get('avg_saccade_velocity', 'N/A')}°/s (Normal range: 400-600°/s)
-- Vertical Saccade Velocity (Avg): {eye_metrics.get('avg_vertical_saccade_velocity', 'N/A')}°/s (Threshold: <200°/s suggests PD)
-- Eye Aspect Ratio (Avg EAR): {eye_metrics.get('avg_ear', 'N/A')} (Normal range: 0.2-0.5)
-- Blink Rate: {eye_metrics.get('blink_rate', 'N/A')} per minute (Normal range: 8-21)
-- Overall Eye-Based Risk Score: {eye_metrics.get('risk_level', 0) * 100:.1f}%
-"""
-
-        if genomic_data and genomic_data.get('patient_variants'):
-            prompt += f"""
-## Genomic Analysis (Secondary Data - Simulated)
-- Genomic Risk Score: {genomic_data.get('genomic_risk_score', 0) * 100:.1f}%
-- Detected Variants:
-"""
-            variants_list = genomic_data.get('patient_variants', {})
-            if variants_list:
-                 for gene, data in variants_list.items():
-                    prompt += f"  - {gene}: {data.get('variant', 'Unknown variant')} (Risk Contribution: {data.get('risk_contribution', 'N/A'):.2f}x)\n"
-            else:
-                prompt += "  - None detected in simulation.\n"
-        else:
-             prompt += "\n## Genomic Analysis (Secondary Data - Simulated)\n- No simulated genomic variants generated based on risk level.\n"
+            logging.error(f"Error formatting prompt: {e}")
+            return "Error: Could not format prompt."
 
 
-        prompt += """
-## Requested Analysis
+    def analyze_combined_data(self, eye_metrics_summary, eye_metrics_raw, genomic_results, patient_info=None, prompt_template=DEFAULT_PROMPT_TEMPLATE):
+        """
+        Sends combined data to OpenRouter LLM for analysis.
 
-Based on the ocular biomarkers and any available simulated genomic data, please provide:
+        Args:
+            eye_metrics_summary (dict): Summary from PDDetector (risk_level, factors).
+            eye_metrics_raw (dict): Raw metrics from EyeTracker.
+            genomic_results (dict): Results from BioNeMoClient.
+            patient_info (dict, optional): Basic patient details (ethnicity, etc.).
+            prompt_template (str, optional): Custom prompt template string.
 
-1.  **Risk Assessment**: Synthesize the eye-tracking and genomic data to estimate the likelihood this patient is developing Parkinson's disease. Explain the confidence level.
-2.  **Biomarker Analysis**: Detail which specific indicators (ocular and genomic, if present) most strongly suggest pre-symptomatic Parkinson's and why. Correlate these with known PD pathology.
-3.  **Clinical Recommendations**: Suggest concrete next steps, including follow-up tests, monitoring frequency, and potential specialist referrals.
-4.  **Preventive/Management Considerations**: Discuss potential lifestyle or other interventions that could be considered based on the risk profile.
-5.  **Summary Report**: Generate a concise clinical summary suitable for inclusion in a patient record or referral to a neurologist.
+        Returns:
+            str: The analysis text from the LLM, or an error message.
+        """
+        if not self.api_key:
+            return "LLM analysis disabled: API key not configured."
 
-Focus particularly on how the ocular metrics correlate with early-stage Parkinson's pathology. The fixation stability and saccade velocities (both overall and vertical) are especially relevant clinical indicators based on recent research. Ensure the language is professional and clinically appropriate.
+        if not all([eye_metrics_summary, eye_metrics_raw, genomic_results]):
+             logging.warning("Attempted LLM analysis with incomplete data.")
+             return "LLM analysis requires eye metrics and genomic results."
 
-**MOH Requirements (Singapore Context):**
-- Include the standard NHG disclaimer for AI-assisted analysis if applicable.
-- Reference the latest SingHealth Parkinson's Disease Clinical Practice Guidelines (currently 2024).
-- Use terminology approved by the Singapore Medical Council (SMC) where relevant (e.g., specific referral pathways).
-"""
-
-        return prompt.strip() # Remove leading/trailing whitespace
-
-    def _generate_mock_analysis(self, patient_data, eye_metrics, genomic_data):
-        """Generate mock analysis when API key not available or API fails"""
-        print("Generating mock analysis...")
-        # Calculate risk level from eye metrics
-        risk_level = eye_metrics.get('risk_level', 0.5) # Default to medium risk if unavailable
-        name = patient_data.get('name', 'the patient')
-
-        # Create simulated analysis with formatting similar to LLM output
-        analysis = f"""
-# Clinical Assessment for {name} (Simulated Analysis)
-
-## Risk Assessment
-
-Based on the provided ocular biomarkers, there is a **{risk_level*100:.1f}% estimated probability** that this patient shows patterns consistent with the pre-symptomatic stage of Parkinson's disease. This simulation uses threshold-based rules derived from eye movement patterns known to be affected in early PD.
-
-## Biomarker Analysis (Simulated Interpretation)
-
-The following indicators contributed to the risk score:
-
-1.  **Fixation Stability**: {eye_metrics.get('fixation_stability', 'N/A')} (Threshold: >0.3). Values above the threshold suggest potential issues with gaze control, sometimes seen in early PD.
-2.  **Saccade Velocity**: {eye_metrics.get('avg_saccade_velocity', 'N/A')}°/s (Threshold: <400°/s). Reduced velocity can indicate basal ganglia dysfunction.
-3.  **Vertical Saccade Velocity**: {eye_metrics.get('avg_vertical_saccade_velocity', 'N/A')}°/s (Threshold: <200°/s). Vertical saccades are often disproportionately affected in PD.
-"""
-
-        if genomic_data and genomic_data.get('patient_variants'):
-            variants = list(genomic_data['patient_variants'].keys())
-            analysis += f"""
-4.  **Simulated Genetic Factors**: The simulation included variants in {', '.join(variants)}, contributing {genomic_data.get('genomic_risk_score', 0)*100:.1f}% to the simulated genomic risk.
-"""
-        else:
-             analysis += "\n4.  **Simulated Genetic Factors**: No high-risk variants were included in this simulation based on the eye-tracking risk level.\n"
-
-
-        analysis += """
-## Clinical Recommendations (Simulated)
-
-1.  **Neurological Consultation**: Recommend consultation with a movement disorder specialist for clinical evaluation.
-2.  **Baseline Monitoring**: Establish baseline clinical scores (e.g., UPDRS) and consider follow-up ocular assessment in 6-12 months.
-3.  **Consider DaTscan**: If clinical suspicion remains high, dopamine transporter imaging could be informative.
-
-## Preventive/Management Considerations (Simulated)
-
-General recommendations often include:
-1.  **Lifestyle Factors**: Regular exercise (aerobic, balance), Mediterranean diet.
-2.  **Symptom Monitoring**: Patient education on early motor and non-motor symptoms of PD.
-
-## Summary Report (Simulated)
-
-Patient {name} presents with ocular metrics yielding a {risk_level*100:.1f}% risk score based on algorithmic analysis. Key contributing factors include [mention 1-2 key factors like fixation stability or saccade velocity if abnormal, otherwise state 'metrics within normal limits']. Simulated genomic data [mention if variants were included or not]. Recommend neurological consultation for clinical correlation and baseline assessment.
-"""
-
-        return {
-            "analysis": analysis.strip(),
-            "model_used": "Mock Analysis (Simulated DeepSeek V3)",
-            "success": True # Mock analysis is considered successful for demo purposes
+        combined_data = {
+            "patient_info": patient_info or {},
+            "eye_metrics_summary": eye_metrics_summary,
+            "eye_metrics_raw": eye_metrics_raw,
+            "genomic_results": genomic_results
         }
 
-    def _generate_error_analysis(self, error_message):
-         """Generate an analysis indicating an error occurred."""
-         print(f"Generating error analysis message: {error_message}")
-         analysis = f"""
-# Clinical Assessment Error
+        prompt = self._format_prompt(prompt_template, combined_data)
+        if prompt.startswith("Error:"):
+            return prompt # Return formatting error
 
-An error occurred while attempting to generate the AI clinical assessment.
+        logging.info(f"Sending request to OpenRouter model: {self.model}")
+        # logging.debug(f"Prompt:\n{prompt}") # Be careful logging PII
 
-**Error Details:** {error_message}
+        try:
+            response = requests.post(
+                url=self.api_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ]
+                },
+                timeout=30 # Set a timeout
+            )
+            response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
 
-Please check the application logs and ensure the OpenRouter API key is valid and the service is reachable.
+            result = response.json()
+            analysis = result['choices'][0]['message']['content']
+            logging.info("Received analysis from OpenRouter.")
+            # logging.debug(f"Analysis:\n{analysis}")
+            return analysis.strip()
 
-**Recommendation:** Review the raw eye-tracking metrics and genomic simulation results manually. Consider retrying the analysis later.
-"""
-         return {
-            "analysis": analysis.strip(),
-            "model_used": "Error State",
-            "success": False
-         }
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error calling OpenRouter API: {e}")
+            return f"Error: Could not connect to OpenRouter API. {e}"
+        except KeyError as e:
+            logging.error(f"Error parsing OpenRouter response: Missing key {e}. Response: {result}")
+            return "Error: Invalid response format from OpenRouter."
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during OpenRouter analysis: {e}")
+            return f"Error: An unexpected error occurred. {e}"
+
+
+# Example Usage
+if __name__ == '__main__':
+    # Make sure to set OPENROUTER_API_KEY environment variable for this test
+    client = OpenRouterClient()
+
+    if not client.api_key:
+        print("Skipping OpenRouter test: OPENROUTER_API_KEY not set.")
+    else:
+        print("\n--- Testing OpenRouter Client ---")
+        # Sample data (mimicking outputs from other modules)
+        sample_patient = {'ethnicity': 'Malay', 'medical_history': 'None relevant'}
+        sample_eye_summary = {'risk_level': 0.65, 'contributing_factors': {'Fixation Stability': 0.3, 'Saccade Velocity (Inv)': 0.25}}
+        sample_eye_raw = {'blink_rate': 12.5, 'fixation_stability': 0.7, 'saccade_velocity': 150.0}
+        sample_genomic = {
+            'simulated_lrrk2_risk': 0.18,
+            'simulated_gba_risk': 0.12,
+            'combined_genetic_risk': 0.30,
+            'variant_profile': 'high_risk_profile',
+            'ethnicity_adjustment_factor': 1.22
+        }
+
+        analysis_result = client.analyze_combined_data(
+            eye_metrics_summary=sample_eye_summary,
+            eye_metrics_raw=sample_eye_raw,
+            genomic_results=sample_genomic,
+            patient_info=sample_patient
+        )
+
+        print("\nLLM Analysis Result:")
+        print(analysis_result)
