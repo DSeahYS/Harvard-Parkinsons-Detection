@@ -1,57 +1,49 @@
-import time
+import threading
 from collections import deque
-import numpy as np
 
 class CycleBuffer:
-    """
-    Manages data collection over fixed time cycles (e.g., 15 seconds).
-    Placeholder implementation.
-    """
-    def __init__(self, cycle_duration=15):
-        self.cycle_duration = cycle_duration
-        self.current_cycle_data = []
-        self.last_cycle_start_time = time.time()
-        print(f"Initialized CycleBuffer with duration: {self.cycle_duration}s")
+    """A thread-safe circular buffer."""
+    def __init__(self, maxlen):
+        """
+        Initializes the CycleBuffer.
 
-    def add_data(self, metrics):
-        """Adds new metrics data to the current cycle."""
-        current_time = time.time()
-        if metrics:
-            self.current_cycle_data.append(metrics)
+        Args:
+            maxlen (int): The maximum size of the buffer.
+        """
+        self.buffer = deque(maxlen=maxlen)
+        self.lock = threading.Lock()
 
-        # Check if cycle duration has passed
-        if current_time - self.last_cycle_start_time >= self.cycle_duration:
-            # Process the completed cycle
-            analysis = self.process_cycle()
-            # Reset for the next cycle
-            self.current_cycle_data = []
-            self.last_cycle_start_time = current_time
-            return analysis
-        return None
+    def append(self, item):
+        """
+        Appends an item to the buffer in a thread-safe manner.
 
-    def process_cycle(self):
-        """Analyzes the data collected over the completed cycle."""
-        if not self.current_cycle_data:
-            return {"message": "No data in cycle"}
+        Args:
+            item: The item to append.
+        """
+        with self.lock:
+            self.buffer.append(item)
 
-        print(f"Processing cycle with {len(self.current_cycle_data)} data points.")
-        # Placeholder: Calculate average metrics over the cycle
-        avg_metrics = {}
-        keys_to_average = ['avg_saccade_velocity', 'avg_vertical_saccade_velocity', 'fixation_stability', 'avg_ear']
+    def mean(self):
+        """
+        Calculates the mean of the items in the buffer in a thread-safe manner.
 
-        for key in keys_to_average:
-            values = [m.get(key) for m in self.current_cycle_data if m and key in m]
-            if values:
-                avg_metrics[f"cycle_{key}"] = np.mean(values)
+        Returns:
+            float: The mean of the items, or 0 if the buffer is empty.
+        """
+        with self.lock:
+            return sum(self.buffer) / len(self.buffer) if self.buffer else 0
 
-        # Add blink rate calculation if needed (similar to pd_detector)
-        # ...
+    def get_all(self):
+        """
+        Returns a copy of all items currently in the buffer in a thread-safe manner.
 
-        print(f"Cycle analysis results: {avg_metrics}")
-        return avg_metrics
+        Returns:
+            list: A list containing all items in the buffer.
+        """
+        with self.lock:
+            return list(self.buffer)
 
-    def is_cycle_analysis_enabled(self):
-        """Checks if cycle analysis should be active (e.g., based on UI checkbox)."""
-        # This might need to be linked to the dashboard's cycle_var
-        # For now, assume it's always potentially active if initialized.
-        return True
+    def __len__(self):
+        """Returns the current number of items in the buffer."""
+        with self.lock:
+            return len(self.buffer)
