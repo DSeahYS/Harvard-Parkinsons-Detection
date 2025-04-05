@@ -1,45 +1,41 @@
-"""
-GenomeGuard - Parkinson's Detection System
-
-A system that combines eye tracking and genomic analysis to detect early signs of Parkinson's disease.
-"""
-import os
-# Suppress TensorFlow warnings
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-# Suppress MediaPipe warnings
-os.environ['GLOG_minloglevel'] = '2'
-import numpy as np
-from datetime import datetime
+import tkinter as tk
 import logging
+import os
+from dotenv import load_dotenv
+import sys
+from src.utils.config import ConfigManager
 
-from src.models.eye_tracker import EyeTracker
-from src.models.pd_detector import ParkinsonsDetector
-from src.frontend.dashboard import Dashboard
+# Initialize configuration first (will setup paths)
+config = ConfigManager()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    filename='genomicguard.log'
-)
+# Ensure the 'src' directory is in the Python path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+src_dir = os.path.join(script_dir, 'src')
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
 
-def main():
-    """Main function to initialize and run the application."""
+try:
+    from frontend.dashboard import Dashboard
+except ImportError as e:
+    logging.error(f"Failed to import Dashboard. Ensure 'src' is in PYTHONPATH or run from GenomeGuard root. Error: {e}")
+    sys.exit(1)
+
+logging.info("Configuration initialized from .env")
+
+# Configure basic logging for the main entry point
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+if __name__ == '__main__':
+    logging.info("Starting GenomeGuard Application...")
+    root = tk.Tk()
     try:
-        # Initialize components
-        eye_tracker = EyeTracker()
-        pd_detector = ParkinsonsDetector()
-        
-        # Initialize metrics history
-        metrics_history = []
-        
-        # Create and run dashboard
-        dashboard = Dashboard(eye_tracker, pd_detector, metrics_history)
-        dashboard.run()
-        
+        app = Dashboard(root)
+        root.mainloop()
+        logging.info("GenomeGuard Application exited normally.")
     except Exception as e:
-        logging.error(f"Error in main function: {str(e)}")
-        raise
-
-if __name__ == "__main__":
-    main()
+        logging.critical(f"An unhandled exception occurred in the main application loop: {e}", exc_info=True)
+        # Optionally show an error message to the user
+        tk.messagebox.showerror("Fatal Error", f"An unexpected error occurred:\n{e}\n\nPlease check the logs.")
+    finally:
+        # Ensure cleanup, though on_close in Dashboard should handle most of it
+        logging.info("Application shutdown sequence initiated.")
