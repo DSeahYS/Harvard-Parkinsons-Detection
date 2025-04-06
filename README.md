@@ -11,7 +11,7 @@ Contributors
 License
 
 ## Key Innovations 🧠
-First Singapore-optimized pre-symptomatic Parkinson's screening combining:
+To-Be First Singapore-optimized pre-symptomatic Parkinson's screening combining:
 MediaPipe Face Mesh for precision eye movement tracking
 Ethnicity-specific analysis (Chinese, Malay, Indian) for Singapore population
 BioNeMo Evo-2 genomic simulation with ethnicity-adjusted risk profiles
