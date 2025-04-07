@@ -1,869 +1,793 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog, Listbox, Scrollbar, Frame, Label, Button, Canvas, Text
-from PIL import Image, ImageTk
+from tkinter import messagebox, simpledialog, ttk, Canvas, Text
 import cv2
-import queue
-import threading
-import logging
+from PIL import Image, ImageTk
 import time
+import queue
 import numpy as np
 import os
-import json # Added for LLM result parsing example
+import json
+import logging
+from pathlib import Path
+
+# Configure logging at module level first
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # --- Project Imports ---
-# Use absolute imports from the project root assuming 'src' is in PYTHONPATH
-# or adjust relative paths carefully based on execution context.
-# If running dashboard.py directly, relative paths might need adjustment or
-# run using `python -m src.frontend.dashboard` from the GenomeGuard directory.
+# Use absolute imports now instead of relative
 try:
-    from ..models.eye_tracker import EyeTracker
-    from ..models.pd_detector import PDDetector
-    from ..genomic.bionemo_client import BioNeMoClient
-    from ..llm.openrouter_client import OpenRouterClient
-    from ..data.storage import StorageManager
-    from ..utils.threading_utils import RTSPCameraStream, ProcessingThread, GenomicAnalysisThread
-    from ..utils import visualization # Import the visualization module
-except ImportError:
-    # Fallback for running script directly (adjust as needed)
-    import sys
-    sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..')) # Add GenomeGuard root to path
-    from src.models.eye_tracker import EyeTracker
-    from src.models.pd_detector import PDDetector
-    from src.genomic.bionemo_client import BioNeMoClient
-    from src.llm.openrouter_client import OpenRouterClient
+    from src.utils.config import Config
     from src.data.storage import StorageManager
-    from src.utils.threading_utils import RTSPCameraStream, ProcessingThread, GenomicAnalysisThread
-    from src.utils import visualization
+    from src.models.eye_tracker import EyeTracker
+    from src.models.pd_detector import PDDetector, RiskLevel
+    from src.genomic.bionemo_client import BioNeMoRiskAssessor
+    from src.llm.openrouter_client import OpenRouterClient
+    from src.utils.threading_utils import RTSPCameraStream, ProcessingThread, GenomicAnalysisThread, LLMAnalysisThread
+    from src.utils.visualization import draw_risk_meter
+except ImportError as e:
+    logger.error(f"Import Error: {e}. Ensure PYTHONPATH is set correctly or run from project root.", exc_info=True)
+    raise ImportError(f"Failed to import required modules: {e}")
 
-
+# --- Logging Setup ---
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 
+# --- Constants ---
+DEFAULT_FONT = ("Arial", 10)
+SECTION_PADY = 5
+SECTION_PADDING = 5
+
+# --- Main Dashboard Class ---
 class Dashboard:
-    """
-    Main Tkinter-based GUI for GenomeGuard application.
-    Manages data processing threads and displays results.
-    """
+    MIN_WIDTH = 1440 # Wider for tabbed interface
+    MIN_HEIGHT = 900
+    COLOR_PRIMARY = '#2c7fb8'
+    COLOR_ALERT = '#ffa500'
+    COLOR_SAFE = '#4caf50'
+    COLOR_WARNING = '#ffeb3b'
+    COLOR_DANGER = '#f44336'
+    FONT_FAMILY = 'Roboto'
+    FONT_SIZES = {
+        'body': 16,
+        'subheader': 18,
+        'header': 20
+    }
+
     def __init__(self, root):
         self.root = root
-        self.root.title("GenomeGuard - Parkinson's Risk Assessment")
-        # Set a default size
-        self.root.geometry("1200x800")
+        logger.info("Initializing Dashboard...")
 
-        # --- Initialize Core Components ---
-        logging.info("Initializing core components...")
-        self.storage = StorageManager() # Singleton instance
-        self.eye_tracker = EyeTracker(refine_landmarks=True) # Use refined landmarks
-        self.pd_detector = PDDetector()
-        self.bionemo_client = BioNeMoClient() # Placeholder/real client
-        self.openrouter_client = OpenRouterClient() # Placeholder/real client
-        logging.info("Core components initialized.")
+        # --- Core Components ---
+        try:
+            self.config = Config()
+            self.storage = StorageManager()
+            self.eye_tracker = EyeTracker()
+            self.pd_detector = PDDetector()
+            self.bionemo_assessor = BioNeMoRiskAssessor()
+            self.llm_client = OpenRouterClient() if self.config.get_openrouter_api_key() else None
+            logger.info("Core components initialized.")
+        except Exception as e:
+            logger.critical(f"Failed to initialize core components: {e}", exc_info=True)
+            messagebox.showerror("Initialization Error", f"Failed to initialize core components:\n{e}")
+            self.root.destroy()
+            return
 
-        # --- Initialize Threading Components ---
-        logging.info("Initializing threading components...")
-        self.processing_result_queue = queue.Queue(maxsize=10) # Queue for results from ProcessingThread
-        self.genomic_input_queue = queue.Queue()   # Queue to send data TO GenomicAnalysisThread
-        self.genomic_output_queue = queue.Queue() # Queue for results FROM GenomicAnalysisThread
-
-        self.camera_stream = None # Will be initialized in start_processing
+        # --- Threading Components ---
+        self.result_queue = queue.Queue(maxsize=50)
+        self.genomic_queue = queue.Queue(maxsize=10)
+        self.llm_queue = queue.Queue(maxsize=5)
+        self.video_thread = None
         self.processing_thread = None
         self.genomic_thread = None
-        logging.info("Threading components initialized.")
+        self.llm_thread = None
+        logger.info("Threading components initialized.")
 
-        # --- State Variables ---
-        self.is_processing = False
+        # --- Session State ---
+        self.session_active = False
         self.current_patient_id = None
-        self.current_patient_info = {}
+        self.current_patient_info = None
         self.current_session_id = None
-        self.session_data_log = [] # Store detailed metrics for saving later
-        self.last_risk_level = None # Store last known risk level
-        self.last_eye_metrics_raw = None # Store last known raw metrics
-        self.last_eye_metrics_summary = None # Store last known summary
-        self.last_genomic_result = None # Store last known genomic result
-        self.selected_history_session_id = None # Track selected past session ID
-        self.loaded_history_session_data = None # Store loaded data for selected past session
+        self.session_start_time = None
+        self.last_metrics_update = {} # Store latest full metrics dict
+        self.last_genomic_update = {} # Store latest genomic results
+        self.last_risk_assessment = (RiskLevel.LOW, "N/A", 0.0, {}) # level, reason, ocular_score, factors
 
-        # --- Setup UI ---
-        self._setup_ui()
+        # --- UI Setup ---
+        logger.info("Setting up UI...")
+        self.setup_ui()
+        logger.info("UI setup complete.")
 
-        # --- Handle Window Closing ---
+        # --- Start Queue Checking & Handle Close ---
+        self.check_queues()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _setup_ui(self):
-        """Creates the main UI layout."""
-        logging.info("Setting up UI...")
-        # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+    def setup_ui(self):
+        self.root.title("WorkingGenomeGuard - Clinical Dashboard")
+        self.root.geometry(f"{self.MIN_WIDTH}x{self.MIN_HEIGHT}")
+        self.root.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
 
-        # --- Left Panel (Controls, Patient Info) ---
-        left_panel = ttk.Frame(main_frame, width=300)
-        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
-        left_panel.pack_propagate(False) # Prevent resizing based on content
+        # --- Main Layout ---
+        # Use PanedWindow for resizable sections if desired, or simple packing
+        top_frame = ttk.Frame(self.root, padding=SECTION_PADDING)
+        top_frame.pack(fill=tk.X)
 
-        # Control Buttons
-        control_frame = ttk.LabelFrame(left_panel, text="Controls", padding="10")
-        control_frame.pack(fill=tk.X, pady=(0, 10))
+        # --- Top Bar (Patient Management & Session Control) ---
+        patient_frame = ttk.LabelFrame(top_frame, text="Patient Management", padding=SECTION_PADDING)
+        patient_frame.pack(side=tk.LEFT, padx=5, pady=SECTION_PADY, fill=tk.X, expand=True)
+        ttk.Button(patient_frame, text="Load Patient", command=self.load_patient).pack(side=tk.LEFT, padx=5)
+        # TODO: Add New Patient functionality (similar to TrueGenomeGuard's PatientDialog)
+        self.patient_info_label = ttk.Label(patient_frame, text="No patient selected.", relief=tk.SUNKEN, padding=2, width=50)
+        self.patient_info_label.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
-        self.start_button = ttk.Button(control_frame, text="Start Processing", command=self.start_processing)
-        self.start_button.pack(fill=tk.X, pady=5)
-        self.stop_button = ttk.Button(control_frame, text="Stop Processing", command=self.stop_processing, state=tk.DISABLED)
-        self.stop_button.pack(fill=tk.X, pady=5)
+        session_frame = ttk.LabelFrame(top_frame, text="Session Control", padding=SECTION_PADDING)
+        session_frame.pack(side=tk.LEFT, padx=5, pady=SECTION_PADY)
+        self.start_btn = ttk.Button(session_frame, text="Start Session", command=self.start_session, state=tk.DISABLED)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        self.stop_btn = ttk.Button(session_frame, text="Stop Session", command=self.stop_session, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        self.session_status_label = ttk.Label(session_frame, text="Status: Idle", relief=tk.SUNKEN, padding=2, width=20)
+        self.session_status_label.pack(side=tk.LEFT, padx=5)
 
-# Removed duplicate block
+        # --- Main Content Area (Divided Vertically) ---
+        content_pane = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
+        content_pane.pack(fill=tk.BOTH, expand=True, padx=SECTION_PADDING, pady=SECTION_PADY)
 
+        # --- Top Row in Content Area ---
+        top_row_pane = ttk.PanedWindow(content_pane, orient=tk.HORIZONTAL)
+        content_pane.add(top_row_pane, weight=1)
 
-        # Patient Selection / Management
-        patient_frame = ttk.LabelFrame(left_panel, text="Patient Management", padding="10")
-        patient_frame.pack(fill=tk.X, pady=(0, 10))
+        # --- Section 1: Patient Information Panel ---
+        patient_details_frame = ttk.LabelFrame(top_row_pane, text="1. Patient Information", padding=SECTION_PADDING)
+        top_row_pane.add(patient_details_frame, weight=1)
+        
+        # Photo display
+        photo_frame = ttk.Frame(patient_details_frame)
+        photo_frame.pack(anchor=tk.W, pady=5)
+        self.patient_photo = Canvas(photo_frame, width=80, height=80, bg='lightgray')
+        self.patient_photo.pack(side=tk.LEFT, padx=5)
+        self.patient_photo.create_text(40, 40, text="Patient\nPhoto", fill="black")
+        
+        # Patient info fields
+        info_frame = ttk.Frame(patient_details_frame)
+        info_frame.pack(anchor=tk.W, fill=tk.X, expand=True)
+        
+        # Name and dropdowns
+        name_frame = ttk.Frame(info_frame)
+        name_frame.pack(anchor=tk.W, fill=tk.X)
+        ttk.Label(name_frame, text="Name:", font=DEFAULT_FONT).pack(side=tk.LEFT)
+        self.patient_name_var = tk.StringVar()
+        self.patient_name_entry = ttk.Entry(name_frame, textvariable=self.patient_name_var, width=20)
+        self.patient_name_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Birthday dropdown
+        dob_frame = ttk.Frame(info_frame)
+        dob_frame.pack(anchor=tk.W, fill=tk.X)
+        ttk.Label(dob_frame, text="Birthday:", font=DEFAULT_FONT).pack(side=tk.LEFT)
+        self.dob_day = ttk.Combobox(dob_frame, values=list(range(1,32)), width=3, state='readonly')
+        self.dob_day.pack(side=tk.LEFT, padx=2)
+        self.dob_month = ttk.Combobox(dob_frame, values=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'], width=4, state='readonly')
+        self.dob_month.pack(side=tk.LEFT, padx=2)
+        self.dob_year = ttk.Combobox(dob_frame, values=list(range(1900, 2026)), width=5, state='readonly')
+        self.dob_year.pack(side=tk.LEFT, padx=2)
+        
+        # Symptoms year
+        symptoms_frame = ttk.Frame(info_frame)
+        symptoms_frame.pack(anchor=tk.W, fill=tk.X)
+        ttk.Label(symptoms_frame, text="Symptoms Started:", font=DEFAULT_FONT).pack(side=tk.LEFT)
+        self.symptoms_year = ttk.Combobox(symptoms_frame, values=list(range(1900, 2026)), width=5, state='readonly')
+        self.symptoms_year.pack(side=tk.LEFT, padx=5)
+        
+        # Contact info
+        contact_frame = ttk.Frame(info_frame)
+        contact_frame.pack(anchor=tk.W, fill=tk.X)
+        ttk.Label(contact_frame, text="Contact:", font=DEFAULT_FONT).pack(side=tk.LEFT)
+        self.contact_entry = ttk.Entry(contact_frame, width=25)
+        self.contact_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Ethnicity dropdown
+        ethnicity_frame = ttk.Frame(info_frame)
+        ethnicity_frame.pack(anchor=tk.W, fill=tk.X)
+        ttk.Label(ethnicity_frame, text="Ethnicity:", font=DEFAULT_FONT).pack(side=tk.LEFT)
+        self.ethnicity_var = tk.StringVar()
+        self.ethnicity_dropdown = ttk.Combobox(ethnicity_frame,
+            values=['Caucasian', 'African', 'Asian', 'Hispanic', 'Other'],
+            textvariable=self.ethnicity_var,
+            state='readonly',
+            width=15)
+        self.ethnicity_dropdown.pack(side=tk.LEFT, padx=5)
+        
+        # Session info
+        session_frame = ttk.Frame(info_frame)
+        session_frame.pack(anchor=tk.W, fill=tk.X)
+        self.pat_info_session_dur = ttk.Label(session_frame, text="Session Duration: 00:00", font=DEFAULT_FONT)
+        self.pat_info_session_dur.pack(side=tk.LEFT, padx=5)
+        self.pat_info_total_sessions = ttk.Label(session_frame, text="Total Sessions: -", font=DEFAULT_FONT)
+        self.pat_info_total_sessions.pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(patient_frame, text="Select Patient:").pack(anchor=tk.W)
-        self.patient_listbox = Listbox(patient_frame, height=6, exportselection=False)
-        self.patient_listbox.pack(fill=tk.X, expand=True, pady=(0, 5))
-        self.patient_listbox.bind('<<ListboxSelect>>', self._on_patient_select)
-        self._load_patients_into_listbox() # Populate listbox
+        # --- Section 2: Primary Ocular Biomarker Visualization ---
+        ocular_frame = ttk.LabelFrame(top_row_pane, text="2. Ocular Biomarkers", padding=SECTION_PADDING)
+        top_row_pane.add(ocular_frame, weight=2) # Give more space
+        
+        # Video Feed and Controls
+        video_control_frame = ttk.Frame(ocular_frame)
+        video_control_frame.pack(fill=tk.BOTH, expand=True, side=tk.LEFT, padx=5)
+        
+        # Video display
+        self.video_label = ttk.Label(video_control_frame, background='black')
+        self.video_label.pack(fill=tk.BOTH, expand=True)
+        
+        # Webcam toggle button
+        self.webcam_toggle = ttk.Button(video_control_frame, text="Toggle Mesh View",
+                                      command=self.toggle_mesh_view)
+        self.webcam_toggle.pack(pady=5)
+        self.show_mesh = True  # Default to showing mesh
+        
+        # Metrics Display Area
+        ocular_metrics_frame = ttk.Frame(ocular_frame)
+        ocular_metrics_frame.pack(fill=tk.Y, side=tk.LEFT, padx=5)
+        
+        # Saccade velocity with threshold indicator
+        saccade_frame = ttk.Frame(ocular_metrics_frame)
+        saccade_frame.pack(anchor=tk.W, pady=2)
+        ttk.Label(saccade_frame, text="Saccade Vel (°/s):", font=DEFAULT_FONT).pack(side=tk.LEFT)
+        self.oc_saccade_vel = ttk.Label(saccade_frame, text="-", font=DEFAULT_FONT, foreground='black')
+        self.oc_saccade_vel.pack(side=tk.LEFT)
+        self.saccade_thresh_ind = Canvas(saccade_frame, width=20, height=20, bg='white', highlightthickness=0)
+        self.saccade_thresh_ind.pack(side=tk.LEFT, padx=5)
+        self.saccade_thresh_ind.create_oval(2, 2, 18, 18, fill='grey', outline='')
+        
+        # Fixation stability
+        self.oc_fixation_stab = ttk.Label(ocular_metrics_frame, text="Fixation Stab (°): -", font=DEFAULT_FONT)
+        self.oc_fixation_stab.pack(anchor=tk.W, pady=2)
+        
+        # Blink rate with normal range indicator
+        blink_frame = ttk.Frame(ocular_metrics_frame)
+        blink_frame.pack(anchor=tk.W, pady=2)
+        ttk.Label(blink_frame, text="Blink Rate (bpm):", font=DEFAULT_FONT).pack(side=tk.LEFT)
+        self.oc_blink_rate = ttk.Label(blink_frame, text="-", font=DEFAULT_FONT)
+        self.oc_blink_rate.pack(side=tk.LEFT)
+        self.blink_range_ind = ttk.Label(blink_frame, text="(Normal: 10-20)", font=("Arial", 8), foreground='grey')
+        self.blink_range_ind.pack(side=tk.LEFT, padx=5)
+        
+        # Anti-saccade performance
+        self.oc_anti_saccade = ttk.Label(ocular_metrics_frame, text="Anti-Saccade Err: -", font=DEFAULT_FONT)
+        self.oc_anti_saccade.pack(anchor=tk.W, pady=2)
+        
+        # Fixation heatmap
+        heatmap_frame = ttk.LabelFrame(ocular_metrics_frame, text="Fixation Heatmap", padding=2)
+        heatmap_frame.pack(pady=5)
+        self.fixation_heatmap_canvas = Canvas(heatmap_frame, bg='black', width=120, height=120)
+        self.fixation_heatmap_canvas.pack()
+        
+        # --- Section 7: Technical Performance Indicators --- (Placing near video)
+        tech_frame = ttk.LabelFrame(ocular_frame, text="7. Technical Indicators", padding=SECTION_PADDING)
+        tech_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=5)
+        self.tech_tracking_qual = ttk.Label(tech_frame, text="Tracking Quality: -", font=DEFAULT_FONT)
+        self.tech_tracking_qual.pack(anchor=tk.W)
+        self.tech_distance = ttk.Label(tech_frame, text="Distance (cm): -", font=DEFAULT_FONT)
+        self.tech_distance.pack(anchor=tk.W)
+        self.tech_calibration = ttk.Label(tech_frame, text="Calibration: N/A", font=DEFAULT_FONT)
+        self.tech_calibration.pack(anchor=tk.W)
 
-        patient_button_frame = ttk.Frame(patient_frame)
-        patient_button_frame.pack(fill=tk.X)
-        ttk.Button(patient_button_frame, text="New", command=self._new_patient).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,2))
-        # Button removed, history is now loaded automatically in the dedicated tab
-        # Add Edit/Delete later if needed
+        # --- Bottom Row in Content Area ---
+        bottom_row_pane = ttk.PanedWindow(content_pane, orient=tk.HORIZONTAL)
+        content_pane.add(bottom_row_pane, weight=1)
 
-        # Current Patient Info Display
-        info_frame = ttk.LabelFrame(left_panel, text="Current Patient", padding="10")
-        info_frame.pack(fill=tk.X, pady=(0, 10))
-        self.patient_name_label = ttk.Label(info_frame, text="Name: N/A")
-        self.patient_name_label.pack(anchor=tk.W)
-        self.patient_ethnicity_label = ttk.Label(info_frame, text="Ethnicity: N/A")
-        self.patient_ethnicity_label.pack(anchor=tk.W)
-        # Add more labels (DOB, History) as needed
+        # --- Section 3: Genomic Analysis Section ---
+        genomic_frame = ttk.LabelFrame(bottom_row_pane, text="3. Genomic Analysis", padding=SECTION_PADDING)
+        bottom_row_pane.add(genomic_frame, weight=1)
+        self.gen_summary = ttk.Label(genomic_frame, text="BioNeMo Summary: -", font=DEFAULT_FONT)
+        self.gen_summary.pack(anchor=tk.W)
+        self.gen_variants_text = Text(genomic_frame, height=4, width=30, wrap=tk.WORD, state=tk.DISABLED)
+        self.gen_variants_text.pack(fill=tk.X, pady=2)
+        self.gen_pathway_label = ttk.Label(genomic_frame, text="Affected Pathways: -", font=DEFAULT_FONT)
+        self.gen_pathway_label.pack(anchor=tk.W)
+        # TODO: Add Pathway Visualization (Canvas Placeholder)
+        self.pathway_canvas = Canvas(genomic_frame, bg='grey', width=150, height=80)
+        self.pathway_canvas.pack(pady=5)
+        self.pathway_canvas.create_text(75, 40, text="Pathway Viz\n(TODO)", fill="white")
 
-        # --- Right Panel (Video Feed, Analysis Tabs) ---
-        right_panel = ttk.Frame(main_frame)
-        right_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # --- Section 4: Combined Risk Assessment ---
+        risk_frame = ttk.LabelFrame(bottom_row_pane, text="4. Combined Risk", padding=SECTION_PADDING)
+        bottom_row_pane.add(risk_frame, weight=1)
+        self.risk_meter_canvas = Canvas(risk_frame, bg='lightgrey', height=50, width=200)
+        self.risk_meter_canvas.pack(pady=5)
+        self.risk_classification_label = ttk.Label(risk_frame, text="Risk Class: -", font=("Arial", 12, "bold"))
+        self.risk_classification_label.pack()
+        self.risk_reason_label = ttk.Label(risk_frame, text="Reason: -", font=DEFAULT_FONT, wraplength=180)
+        self.risk_reason_label.pack()
+        self.risk_confidence_label = ttk.Label(risk_frame, text="Confidence: -", font=DEFAULT_FONT)
+        self.risk_confidence_label.pack()
 
-        # Video Feed Area
-        video_frame = ttk.LabelFrame(right_panel, text="Live Feed", padding="5")
-        video_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10)) # Allow expansion
+        # --- Section 5: Longitudinal Tracking ---
+        longitudinal_frame = ttk.LabelFrame(bottom_row_pane, text="5. Longitudinal Tracking", padding=SECTION_PADDING)
+        bottom_row_pane.add(longitudinal_frame, weight=2) # Give more space
+        # TODO: Add Trend Visualization (Canvas Placeholder for Matplotlib/Plotly)
+        self.trend_canvas = Canvas(longitudinal_frame, bg='grey', width=300, height=150)
+        self.trend_canvas.pack(pady=5, fill=tk.BOTH, expand=True)
+        self.trend_canvas.create_text(150, 75, text="Trend Graphs (TODO)", fill="white")
+        self.long_baseline_comp = ttk.Label(longitudinal_frame, text="Baseline Comparison: -", font=DEFAULT_FONT)
+        self.long_baseline_comp.pack(anchor=tk.W)
+        self.long_population_comp = ttk.Label(longitudinal_frame, text="Population Comparison: -", font=DEFAULT_FONT)
+        self.long_population_comp.pack(anchor=tk.W)
 
-        # Use Canvas for potential drawing over video later
-        self.video_canvas = Canvas(video_frame, bg="black")
-        self.video_canvas.pack(fill=tk.BOTH, expand=True)
-        # Placeholder text until feed starts
-        self.video_placeholder = self.video_canvas.create_text(320, 240, text="Webcam Feed Disconnected", fill="white", font=("Arial", 16))
-        self.video_label_ref = None # To hold the PhotoImage reference
+        # --- Section 6: Clinical Decision Support ---
+        cds_frame = ttk.LabelFrame(bottom_row_pane, text="6. Clinical Decision Support", padding=SECTION_PADDING)
+        bottom_row_pane.add(cds_frame, weight=1)
+        self.cds_findings_label = ttk.Label(cds_frame, text="Automated Findings:", font=DEFAULT_FONT)
+        self.cds_findings_label.pack(anchor=tk.W)
+        self.cds_findings_text = Text(cds_frame, height=4, width=30, wrap=tk.WORD, state=tk.DISABLED, bg='lightyellow')
+        self.cds_findings_text.pack(fill=tk.X, pady=2)
+        self.cds_actions_label = ttk.Label(cds_frame, text="Suggested Actions: -", font=DEFAULT_FONT)
+        self.cds_actions_label.pack(anchor=tk.W)
+        self.cds_medication_label = ttk.Label(cds_frame, text="Medication Tracking: -", font=DEFAULT_FONT)
+        self.cds_medication_label.pack(anchor=tk.W)
 
-        # Analysis Tabs
-        self.notebook = ttk.Notebook(right_panel)
-        self.notebook.pack(fill=tk.BOTH, expand=True)
+        # --- Section 8: Export and Sharing Options ---
+        export_frame = ttk.LabelFrame(self.root, text="8. Export & Sharing", padding=SECTION_PADDING)
+        export_frame.pack(fill=tk.X, padx=SECTION_PADDING, pady=SECTION_PADY)
+        self.report_button = ttk.Button(export_frame, text="Generate Clinical Report (LLM)", command=self.generate_report, state=tk.DISABLED)
+        self.report_button.pack(side=tk.LEFT, padx=5)
+        # TODO: Add Data Export Button
+        # TODO: Add Sharing Controls Button/Options
 
-        # Tab 1: Eye Metrics
-        eye_tab = ttk.Frame(self.notebook, padding="10")
-        self.notebook.add(eye_tab, text="Eye Analysis")
-        # Risk Meter (Canvas)
-        self.risk_meter_canvas = Canvas(eye_tab, width=200, height=50, bg='lightgrey') # Made smaller
-        self.risk_meter_canvas.pack(pady=10)
-        self.risk_meter_ref = None # Reference for risk meter image
-        # Metrics Display (Labels)
-        metrics_frame = ttk.Frame(eye_tab)
-        metrics_frame.pack(fill=tk.X, pady=5)
-        self.metrics_labels = {}
-        metric_keys = ['saccade_velocity', 'fixation_stability', 'blink_rate', 'vertical_saccade_velocity', 'eye_aspect_ratio_left'] # Example keys
-        for key in metric_keys:
-            frame = ttk.Frame(metrics_frame)
-            frame.pack(fill=tk.X)
-            ttk.Label(frame, text=f"{key.replace('_', ' ').title()}:").pack(side=tk.LEFT, padx=5)
-            self.metrics_labels[key] = ttk.Label(frame, text="N/A", width=15, anchor=tk.W)
-            self.metrics_labels[key].pack(side=tk.LEFT)
-        # Add contributing factors display
-        self.factors_label = ttk.Label(eye_tab, text="Contributing Factors: N/A", wraplength=300, justify=tk.LEFT)
-        self.factors_label.pack(pady=5, anchor=tk.W)
-
-
-        # Tab 2: Genomic Analysis
-        genomic_tab = ttk.Frame(self.notebook, padding="10")
-        self.notebook.add(genomic_tab, text="Genomic Simulation")
-        self.genomic_trigger_button = ttk.Button(genomic_tab, text="Run Genomic Simulation", command=self._trigger_genomic_analysis, state=tk.DISABLED)
-        self.genomic_trigger_button.pack(pady=10)
-        self.genomic_results_text = Text(genomic_tab, height=10, width=60, wrap=tk.WORD, state=tk.DISABLED)
-        self.genomic_results_text.pack(fill=tk.BOTH, expand=True)
-
-        # Tab 3: LLM Analysis
-        llm_tab = ttk.Frame(self.notebook, padding="10")
-        self.notebook.add(llm_tab, text="LLM Summary")
-        self.llm_trigger_button = ttk.Button(llm_tab, text="Get LLM Analysis", command=self._trigger_llm_analysis, state=tk.DISABLED)
-        self.llm_trigger_button.pack(pady=10)
-        self.llm_results_text = Text(llm_tab, height=10, width=60, wrap=tk.WORD, state=tk.DISABLED)
-        self.llm_results_text.pack(fill=tk.BOTH, expand=True)
-
-        # Tab 4: Patient History
-        history_tab = ttk.Frame(self.notebook, padding="10")
-        self.notebook.add(history_tab, text="Patient History")
-
-        history_list_frame = ttk.Frame(history_tab)
-        history_list_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
-        ttk.Label(history_list_frame, text="Past Sessions:").pack(anchor=tk.W)
-        self.history_listbox = Listbox(history_list_frame, height=15, exportselection=False)
-        history_scrollbar = Scrollbar(history_list_frame, orient=tk.VERTICAL, command=self.history_listbox.yview)
-        self.history_listbox.config(yscrollcommand=history_scrollbar.set)
-        self.history_listbox.pack(side=tk.LEFT, fill=tk.Y)
-        history_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.history_listbox.bind('<<ListboxSelect>>', self._on_session_history_select)
-
-        history_detail_frame = ttk.Frame(history_tab)
-        history_detail_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttk.Label(history_detail_frame, text="Session Details:").pack(anchor=tk.W)
-        self.history_detail_text = Text(history_detail_frame, height=15, width=60, wrap=tk.WORD, state=tk.DISABLED)
-        detail_scrollbar = Scrollbar(history_detail_frame, orient=tk.VERTICAL, command=self.history_detail_text.yview)
-        self.history_detail_text.config(yscrollcommand=detail_scrollbar.set)
-        self.history_detail_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        detail_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        # Add button to trigger LLM for selected history item
-        self.llm_history_button = ttk.Button(history_detail_frame, text="Analyze Selected Session (LLM)", command=lambda: self._trigger_llm_analysis(use_history=True), state=tk.DISABLED)
-        self.llm_history_button.pack(pady=5)
-
-        logging.info("UI setup complete.")
-
-    # --- Patient Management Methods ---
-    def _load_patients_into_listbox(self):
-        """Loads patient names and IDs from storage into the listbox."""
-        self.patient_listbox.delete(0, tk.END)
-        patients = self.storage.list_patients()
-        for patient in patients:
-            self.patient_listbox.insert(tk.END, f"{patient['name']} (ID: {patient['id']})")
-            # Store patient ID along with the display text if needed, e.g., using a dictionary
-            # self.patient_map[f"{patient['name']} (ID: {patient['id']})"] = patient['id']
-
-    def _on_patient_select(self, event=None):
-        """Handles selection of a patient from the listbox."""
-        selected_indices = self.patient_listbox.curselection()
-        if not selected_indices:
-            return
-        selected_text = self.patient_listbox.get(selected_indices[0])
-        # Extract ID (assuming format "Name (ID: id)")
+    def load_patient(self):
+        # Simplified patient loading - replace with a proper selection dialog
         try:
-            self.current_patient_id = int(selected_text.split("(ID: ")[1].replace(")", ""))
-            self.current_patient_info = self.storage.get_patient(self.current_patient_id)
-            if self.current_patient_info:
-                self.patient_name_label.config(text=f"Name: {self.current_patient_info.get('name', 'N/A')}")
-                self.patient_ethnicity_label.config(text=f"Ethnicity: {self.current_patient_info.get('ethnicity', 'N/A')}")
-                logging.info(f"Selected patient ID: {self.current_patient_id}")
-                # Enable analysis buttons if a patient is selected and processing is active
-                self.genomic_trigger_button.config(state=tk.NORMAL if self.is_processing else tk.DISABLED)
-                self.llm_trigger_button.config(state=tk.NORMAL if self.is_processing else tk.DISABLED) # LLM for live data
-                # Load and display patient's session history
-                self._display_patient_sessions()
+            # List available patients (IDs and names)
+            patients = self.storage.list_patients()
+            if not patients:
+                messagebox.showinfo("No Patients", "No patients found in the database.", parent=self.root)
+                return
 
+            # Simple dialog to choose ID (replace with a better list selection)
+            patient_id_str = simpledialog.askstring("Load Patient",
+                                                    "Enter Patient Internal ID to load:",
+                                                    parent=self.root)
+            if not patient_id_str: return
+
+            patient_db_id = int(patient_id_str)
+            patient_info = self.storage.get_patient_info(patient_db_id)
+
+            if patient_info:
+                self.current_patient_id = patient_db_id
+                self.current_patient_info = patient_info
+                self.update_patient_display()
+                self.start_btn.config(state=tk.NORMAL)
+                logger.info(f"Loaded patient ID: {patient_db_id} ({patient_info.get('patient_id_str', 'N/A')})")
+                # TODO: Load patient history for longitudinal view
             else:
-                self._clear_patient_selection()
-        except (IndexError, ValueError) as e:
-            logging.error(f"Error parsing patient ID from listbox: {selected_text} - {e}")
-            self._clear_patient_selection()
+                messagebox.showerror("Error", f"Patient with internal ID {patient_db_id} not found.", parent=self.root)
+                self._clear_patient_data()
 
-    def _clear_patient_selection(self):
-        """Resets current patient info."""
-        self.current_patient_id = None
-        self.current_patient_info = {}
-        self.patient_name_label.config(text="Name: N/A")
-        self.patient_ethnicity_label.config(text="Ethnicity: N/A")
-        self.genomic_trigger_button.config(state=tk.DISABLED)
-        self.llm_trigger_button.config(state=tk.DISABLED)
-        self.history_listbox.delete(0, tk.END) # Clear history list
-        self.history_detail_text.config(state=tk.NORMAL)
-        self.history_detail_text.delete('1.0', tk.END)
-        self.history_detail_text.config(state=tk.DISABLED)
-        self.llm_history_button.config(state=tk.DISABLED)
-        self.selected_history_session_id = None
-        self.loaded_history_session_data = None
-        logging.info("Cleared patient selection and history.")
-
-
-    def _new_patient(self):
-        """Opens dialog to add a new patient."""
-        name = simpledialog.askstring("New Patient", "Enter Patient Name:")
-        if not name: return
-        ethnicity = simpledialog.askstring("New Patient", "Enter Ethnicity (e.g., chinese, malay, indian):")
-        # Add more fields (DOB, medical history) as needed
-        new_id = self.storage.add_patient(name, ethnicity=ethnicity)
-        if new_id:
-            messagebox.showinfo("Success", f"Patient '{name}' added with ID {new_id}.")
-            self._load_patients_into_listbox()
-            # Optionally auto-select the new patient
-        else:
-            messagebox.showerror("Error", "Failed to add patient.")
-
-    def _display_patient_sessions(self):
-        """Fetches and displays past sessions for the current patient."""
-        self.history_listbox.delete(0, tk.END)
-        self.history_detail_text.config(state=tk.NORMAL)
-        self.history_detail_text.delete('1.0', tk.END)
-        self.history_detail_text.insert(tk.END, "Select a session from the list.")
-        self.history_detail_text.config(state=tk.DISABLED)
-        self.llm_history_button.config(state=tk.DISABLED)
-        self.selected_history_session_id = None
-        self.loaded_history_session_data = None
-
-
-        if not self.current_patient_id:
-            return
-
-        sessions = self.storage.get_patient_sessions(self.current_patient_id)
-        if not sessions:
-            self.history_listbox.insert(tk.END, "No past sessions found.")
-            return
-
-        for session in sessions:
-            start_time = session.get('start_time', 'N/A')
-            session_id = session.get('id')
-            risk = session.get('avg_risk_level')
-            risk_str = f"{risk:.3f}" if risk is not None else "N/A"
-            display_text = f"ID: {session_id} | Start: {start_time} | Avg Risk: {risk_str}"
-            self.history_listbox.insert(tk.END, display_text)
-            # Could store session ID mapping if needed, similar to patient list
-
-    def _on_session_history_select(self, event=None):
-        """Handles selection of a session from the history listbox."""
-        selected_indices = self.history_listbox.curselection()
-        if not selected_indices:
-            return
-        selected_text = self.history_listbox.get(selected_indices[0])
-
-        # Extract session ID
-        try:
-            session_id_str = selected_text.split("ID: ")[1].split(" |")[0]
-            self.selected_history_session_id = int(session_id_str)
-            logging.info(f"Selected history session ID: {self.selected_history_session_id}")
-
-            # Load session details from JSON
-            self.loaded_history_session_data = self.storage.get_session_details(self.selected_history_session_id)
-
-            self.history_detail_text.config(state=tk.NORMAL)
-            self.history_detail_text.delete('1.0', tk.END)
-
-            if self.loaded_history_session_data:
-                # Display formatted JSON or summary
-                # Ensure loaded_history_session_data is treated as a list of log entries
-                if isinstance(self.loaded_history_session_data, list):
-                     display_str = f"Session Log ({len(self.loaded_history_session_data)} entries):\n"
-                     # Display first few entries as example, or summary stats
-                     for i, entry in enumerate(self.loaded_history_session_data[:5]): # Show first 5
-                         ts = time.strftime('%H:%M:%S', time.localtime(entry.get('timestamp', 0)))
-                         risk = entry.get('risk_results', [None])[0]
-                         risk_str = f"{risk:.3f}" if risk is not None else "N/A"
-                         display_str += f"- {ts}: Risk={risk_str}\n"
-                     if len(self.loaded_history_session_data) > 5:
-                         display_str += f"... ({len(self.loaded_history_session_data) - 5} more entries)"
-                else:
-                    # Fallback if data is not a list (e.g., older format?)
-                    display_str = json.dumps(self.loaded_history_session_data, indent=2, cls=self.storage.NumpyEncoder)
-
-                self.history_detail_text.insert(tk.END, display_str)
-                self.llm_history_button.config(state=tk.NORMAL) # Enable LLM analysis for this session
-            else:
-                self.history_detail_text.insert(tk.END, f"Could not load details for session {self.selected_history_session_id}.")
-                self.llm_history_button.config(state=tk.DISABLED)
-
-            self.history_detail_text.config(state=tk.DISABLED)
-
-        except (IndexError, ValueError, TypeError) as e:
-            logging.error(f"Error parsing session ID or loading details: {selected_text} - {e}", exc_info=True)
-            self.history_detail_text.config(state=tk.NORMAL)
-            self.history_detail_text.delete('1.0', tk.END)
-            self.history_detail_text.insert(tk.END, "Error loading session details.")
-            self.history_detail_text.config(state=tk.DISABLED)
-            self.llm_history_button.config(state=tk.DISABLED)
-            self.selected_history_session_id = None
-            self.loaded_history_session_data = None
-
-    # --- Mode Control Callbacks ---
-    def _toggle_debug_mode(self):
-        """Callback for the debug mode checkbutton."""
-        is_debug = self.debug_mode_var.get()
-        self.eye_tracker.set_debug_mode(is_debug)
-        logging.info(f"Debug mode set to: {is_debug}")
-
-    def _set_eye_processing_mode(self):
-        """Callback for the eye processing mode radio buttons."""
-        mode = self.eye_mode_var.get()
-        self.eye_tracker.set_eye_processing_mode(mode)
-        logging.info(f"Eye processing mode set to: {mode}")
-        # Optionally clear metrics display when mode changes?
-        for label in self.metrics_labels.values():
-            label.config(text="N/A")
-        self.factors_label.config(text="Contributing Factors: N/A")
-        if self.risk_meter_canvas.winfo_exists():
-             self.risk_meter_canvas.delete("all")
-             self.risk_meter_canvas.create_text(100, 25, text="Risk: N/A", fill="black")
-    # --- Processing Control ---
-    def start_processing(self):
-        """Starts the camera capture and processing threads."""
-        if self.is_processing:
-            logging.warning("Processing already running.")
-            return
-
-        logging.info("Starting processing...")
-        try:
-            # Initialize camera stream here to ensure it's fresh
-            self.camera_stream = RTSPCameraStream(src=0).start()
-            time.sleep(1.0) # Give camera time to initialize
-
-            # Start a new session in the database
-            self.current_session_id = self.storage.start_session(self.current_patient_id)
-            self.session_data_log = [] # Reset log for new session
-            self.last_risk_level = None # Reset state
-            self.last_eye_metrics_raw = None
-            self.last_eye_metrics_summary = None
-            self.last_genomic_result = None
-
-
-            # Initialize and start processing thread
-            self.processing_thread = ProcessingThread(
-                self.camera_stream,
-                self.processing_result_queue,
-                self.eye_tracker,
-                self.pd_detector
-            )
-            self.processing_thread.start()
-
-            # Initialize and start genomic thread (it will wait for input)
-            self.genomic_thread = GenomicAnalysisThread(
-                self.genomic_input_queue,
-                self.genomic_output_queue,
-                self.bionemo_client
-            )
-            self.genomic_thread.start()
-
-
-            self.is_processing = True
-            self.start_button.config(state=tk.DISABLED)
-            self.stop_button.config(state=tk.NORMAL)
-            if self.current_patient_id: # Enable analysis buttons only if patient selected
-                 self.genomic_trigger_button.config(state=tk.NORMAL)
-                 self.llm_trigger_button.config(state=tk.NORMAL)
-
-            # Start checking the queue for results
-            self._check_queues()
-            logging.info("Processing started.")
-
+        except ValueError:
+             messagebox.showerror("Error", "Invalid Patient ID entered.", parent=self.root)
         except Exception as e:
-            logging.error(f"Error starting processing: {e}", exc_info=True)
-            messagebox.showerror("Error", f"Failed to start processing:\n{e}")
-            # Clean up if partial start occurred
-            if self.camera_stream: self.camera_stream.stop()
-            if self.processing_thread and self.processing_thread.is_alive(): self.processing_thread.stop()
-            if self.genomic_thread and self.genomic_thread.is_alive(): self.genomic_thread.stop()
-            self.is_processing = False
+             logger.error(f"Error loading patient: {e}", exc_info=True)
+             messagebox.showerror("Error", f"An unexpected error occurred: {e}", parent=self.root)
 
-
-    def stop_processing(self):
-        """Stops the processing threads and resets for clean restart."""
-        if not self.is_processing:
-            logging.warning("Processing not running.")
+    def update_patient_display(self):
+        """Updates the UI elements with current patient data."""
+        if not self.current_patient_info:
+            self._clear_patient_data()
             return
 
-        logging.info("Stopping processing...")
-        self.is_processing = False # Signal queue checker to stop requesting frames
+        p_info = self.current_patient_info
+        id_str = p_info.get('patient_id_str', 'N/A')
+        ethnicity = p_info.get('ethnicity', 'N/A')
+        dob = p_info.get('dob', 'N/A')
+        history = p_info.get('medical_history', 'N/A')
+        symptom_year = p_info.get('symptom_year', 'N/A')
+        contact = p_info.get('contact', 'N/A')
+        total_sessions = p_info.get('total_sessions', 'N/A')
 
-        # Clear any pending frames in queues
-        self._clear_queues()
+        # Top bar info
+        self.patient_info_label.config(text=f"Loaded: {id_str} ({ethnicity})")
+        
+        # Section 1 info
+        self.patient_name_var.set(id_str)
+        
+        # Parse and set DOB if in format "DD-MMM-YYYY"
+        if dob and isinstance(dob, str) and len(dob.split('-')) == 3:
+            day, month, year = dob.split('-')
+            self.dob_day.set(day)
+            self.dob_month.set(month)
+            self.dob_year.set(year)
+        else:
+            self.dob_day.set('')
+            self.dob_month.set('')
+            self.dob_year.set('')
+            
+        self.symptoms_year.set(symptom_year)
+        self.contact_entry.delete(0, tk.END)
+        self.contact_entry.insert(0, contact)
+        self.ethnicity_var.set(ethnicity)
+        self.pat_info_total_sessions.config(text=f"Total Sessions: {total_sessions}")
+
+    def _clear_patient_data(self):
+        """Clears patient-specific UI elements."""
+        self.current_patient_id = None
+        self.current_patient_info = None
+        # Top bar
+        self.patient_info_label.config(text="No patient selected.")
+        self.start_btn.config(state=tk.DISABLED)
+        # Section 1
+        self.patient_name_var.set("")
+        self.dob_day.set('')
+        self.dob_month.set('')
+        self.dob_year.set('')
+        self.symptoms_year.set('')
+        self.contact_entry.delete(0, tk.END)
+        self.ethnicity_var.set('')
+        self.pat_info_total_sessions.config(text="Total Sessions: -")
+        # Clear photo
+        self.patient_photo.delete("all")
+        self.patient_photo.create_text(40, 40, text="Patient\nPhoto", fill="black")
+        # TODO: Clear history/longitudinal views
+
+    def start_session(self):
+        if self.session_active:
+            messagebox.showwarning("Session Active", "A session is already running.", parent=self.root)
+            return
+        if not self.current_patient_id:
+            messagebox.showwarning("No Patient", "Please load a patient first.", parent=self.root)
+            return
+
+        logger.info("Starting session...")
+        self.session_active = True
+        self.session_start_time = time.time()
+        self.last_metrics_update = {}
+        self.last_genomic_update = {}
+        self.last_risk_assessment = (RiskLevel.LOW, "N/A", 0.0, {})
+
+        # Start DB session logging
+        try:
+            self.current_session_id = self.storage.start_session(self.current_patient_id)
+            logger.info(f"Started session ID: {self.current_session_id} for patient ID: {self.current_patient_id}")
+        except Exception as e:
+            logger.error(f"Failed to start database session: {e}", exc_info=True)
+            messagebox.showerror("Database Error", f"Failed to start session logging: {e}", parent=self.root)
+            self.session_active = False
+            return
+
+        # Start camera thread
+        self.video_thread = RTSPCameraStream(source=0).start() # Use webcam 0
+        time.sleep(1) # Give camera time to initialize
+
+        if not self.video_thread or not self.video_thread.is_running():
+             messagebox.showerror("Camera Error", "Failed to start camera stream.", parent=self.root)
+             logger.error("Failed to start camera stream.")
+             self.storage.end_session(self.current_session_id, error="Camera failed") # End session with error
+             self.session_active = False
+             self.current_session_id = None
+             return
+
+        # Start processing threads
+        self.processing_thread = ProcessingThread(
+            self.eye_tracker,
+            self.pd_detector,
+            self.video_thread.frame_queue,
+            self.result_queue,
+            self.genomic_queue, # Pass queue for triggering genomic analysis
+            debug_mode=False # Start in non-debug mode for clinical view
+        ).start()
+
+        self.genomic_thread = GenomicAnalysisThread(
+            self.bionemo_assessor, # Use the new assessor class
+            self.genomic_queue,
+            self.result_queue,
+            self.current_patient_info['ethnicity'] if self.current_patient_info else 'Other'
+        ).start()
+
+        if self.llm_client:
+            self.llm_thread = LLMAnalysisThread(
+                self.llm_client,
+                self.llm_queue,
+                self.result_queue
+            ).start()
+            logger.info("LLM thread started.")
+        else:
+             logger.info("LLM client not configured, LLM thread not started.")
+
+        # Update UI
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.report_button.config(state=tk.DISABLED) # Disable report gen during session
+        self.session_status_label.config(text=f"Status: Running (Sess: {self.current_session_id})")
+        self._clear_displays() # Clear previous results
+        logger.info("Session started successfully.")
+
+    def stop_session(self):
+        if not self.session_active:
+            return
+
+        logger.info("Stopping session...")
+        self.session_active = False
 
         # Stop threads gracefully
-        if self.genomic_thread and self.genomic_thread.is_alive():
-            self.genomic_thread.stop()
-        if self.processing_thread and self.processing_thread.is_alive():
-            self.processing_thread.reset() # Reset with fresh resources
+        self.stop_session_threads()
 
-        # Reset camera stream if exists
-        if hasattr(self, 'camera_stream'):
-            self.camera_stream.stop()
-        if self.camera_stream:
-            self.camera_stream.stop()
-
-        # Wait for threads to finish (optional, but good practice)
-        # Add timeouts
-        if self.processing_thread and self.processing_thread.is_alive(): self.processing_thread.join(timeout=2)
-        if self.genomic_thread and self.genomic_thread.is_alive(): self.genomic_thread.join(timeout=2)
-
-
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
-        self.genomic_trigger_button.config(state=tk.DISABLED)
-        self.llm_trigger_button.config(state=tk.DISABLED)
-
-        # End the session in the database and save detailed log
+        # End DB session logging
         if self.current_session_id:
-            avg_risk = np.mean([item['risk_results'][0] for item in self.session_data_log if item.get('risk_results')]) if self.session_data_log else None
-            json_filename = self.storage.save_session_details(self.current_session_id, self.session_data_log)
-            self.storage.end_session(self.current_session_id, avg_risk_level=avg_risk, json_log_filename=json_filename)
-            logging.info(f"Session {self.current_session_id} ended and saved.")
-            self.current_session_id = None
-
-    def _clear_queues(self):
-        """Clears all processing queues to prepare for restart."""
-        try:
-            while not self.processing_result_queue.empty():
-                self.processing_result_queue.get_nowait()
-            while not self.genomic_input_queue.empty():
-                self.genomic_input_queue.get_nowait()
-            while not self.genomic_output_queue.empty():
-                self.genomic_output_queue.get_nowait()
-            logging.info("Cleared all processing queues")
-        except queue.Empty:
-            pass
-        except Exception as e:
-            logging.warning(f"Error clearing queues: {e}")
-
-        # Clear video display
-        if self.video_label_ref:
-             self.video_canvas.delete("all") # Clear previous image/text
-             # Check if canvas exists before creating text
-             if self.video_canvas.winfo_exists():
-                 canvas_w = self.video_canvas.winfo_width()
-                 canvas_h = self.video_canvas.winfo_height()
-                 self.video_placeholder = self.video_canvas.create_text(canvas_w//2 if canvas_w > 0 else 320,
-                                                                        canvas_h//2 if canvas_h > 0 else 240,
-                                                                        text="Webcam Feed Disconnected", fill="white", font=("Arial", 16))
-             self.video_label_ref = None
-
-
-        logging.info("Processing stopped.")
-
-
-    # --- Queue Handling and UI Updates ---
-    def _check_queues(self):
-        """Periodically checks result queues and schedules UI updates."""
-        # Check processing queue
-        try:
-            while True: # Process all available items
-                result = self.processing_result_queue.get_nowait()
-                self._update_display(result)
-                # Log data for session saving
-                if self.current_session_id:
-                    # Add timestamp for logging
-                    result['timestamp'] = time.time()
-                    # Store only necessary parts if result is large
-                    log_entry = {
-                        'timestamp': result['timestamp'],
-                        'raw_metrics': result.get('raw_metrics'),
-                        'risk_results': result.get('risk_results')
-                        # Avoid storing full frames in the log
-                    }
-                    self.session_data_log.append(log_entry)
-
-        except queue.Empty:
-            pass # No new processing results
-
-        # Check genomic analysis output queue
-        try:
-            while True:
-                genomic_result = self.genomic_output_queue.get_nowait()
-                self.last_genomic_result = genomic_result # Store latest result
-                self._update_genomic_display(genomic_result)
-        except queue.Empty:
-            pass # No new genomic results
-
-        # Reschedule check if processing is still active
-        if self.is_processing:
-            self.root.after(50, self._check_queues) # Check again in 50ms
-
-    def _convert_frame_to_tk(self, frame):
-        """Converts an OpenCV frame (BGR) to a Tkinter PhotoImage."""
-        if frame is None:
-            return None
-        try:
-            # Ensure frame is in RGB format for PIL
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # Resize frame to fit canvas if necessary (optional)
-            # target_w, target_h = 640, 480 # Example target size
-            # frame_rgb = cv2.resize(frame_rgb, (target_w, target_h))
-
-            img = Image.fromarray(frame_rgb)
-            imgtk = ImageTk.PhotoImage(image=img)
-            return imgtk
-        except Exception as e:
-            logging.error(f"Error converting frame to Tkinter format: {e}")
-            return None
-
-    def _update_display(self, result_data):
-        """Updates the UI with data from the processing thread. Runs in MainThread."""
-        processed_frame = result_data.get('processed_frame')
-        metrics = result_data.get('raw_metrics')
-        risk_results = result_data.get('risk_results') # Tuple (risk_level, factors)
-
-        # Store latest results for potential use by analysis triggers
-        self.last_eye_metrics_raw = metrics
-        self.last_eye_metrics_summary = {'risk_level': risk_results[0] if risk_results else None,
-                                         'contributing_factors': risk_results[1] if risk_results else {}}
-        if risk_results:
-            self.last_risk_level = risk_results[0]
-
-
-        # --- Update Video Feed ---
-        imgtk = self._convert_frame_to_tk(processed_frame)
-        if imgtk and self.video_canvas.winfo_exists():
-            self.video_label_ref = imgtk # Keep reference!
-            self.video_canvas.delete("all") # Clear previous image/text
-            # Calculate position to center image if smaller than canvas
-            canvas_w = self.video_canvas.winfo_width()
-            canvas_h = self.video_canvas.winfo_height()
-            img_x = (canvas_w - imgtk.width()) // 2 if canvas_w > 0 else 0
-            img_y = (canvas_h - imgtk.height()) // 2 if canvas_h > 0 else 0
-            self.video_canvas.create_image(img_x, img_y, anchor=tk.NW, image=imgtk)
-        elif self.video_placeholder is None and self.video_canvas.winfo_exists(): # Only recreate placeholder if it doesn't exist
-             self.video_canvas.delete("all")
-             canvas_w = self.video_canvas.winfo_width()
-             canvas_h = self.video_canvas.winfo_height()
-             self.video_placeholder = self.video_canvas.create_text(canvas_w//2 if canvas_w > 0 else 320,
-                                                                    canvas_h//2 if canvas_h > 0 else 240,
-                                                                    text="Error displaying frame", fill="red", font=("Arial", 16))
-
-
-        # --- Update Metrics ---
-        if metrics:
-            for key, label in self.metrics_labels.items():
-                value = metrics.get(key)
-                if value is not None:
-                    label.config(text=f"{value:.3f}" if isinstance(value, float) else str(value))
+            try:
+                # TODO: Calculate average risk or other summary stats for the session
+                session_log_path = self.storage.end_session(
+                    self.current_session_id,
+                    raw_log_data=self.processing_thread.get_raw_log() if self.processing_thread else []
+                )
+                logger.info(f"Ended session ID: {self.current_session_id}")
+                if session_log_path:
+                     messagebox.showinfo("Session Saved", f"Session {self.current_session_id} ended.\nLog saved to:\n{session_log_path}", parent=self.root)
                 else:
-                    label.config(text="N/A")
+                     messagebox.showinfo("Session Ended", f"Session {self.current_session_id} ended.", parent=self.root)
+            except Exception as e:
+                logger.error(f"Failed to end database session {self.current_session_id}: {e}", exc_info=True)
+                messagebox.showerror("Database Error", f"Failed to properly end session logging: {e}", parent=self.root)
 
-        # --- Update Risk Meter & Factors ---
-        if risk_results:
-            risk_level, factors = risk_results
-            # Update meter visualization
-            risk_meter_img = visualization.create_risk_meter(risk_level, width=200, height=50) # Smaller meter
-            risk_meter_tk = self._convert_frame_to_tk(risk_meter_img)
-            if risk_meter_tk and self.risk_meter_canvas.winfo_exists():
-                self.risk_meter_ref = risk_meter_tk # Keep reference
-                self.risk_meter_canvas.delete("all")
-                self.risk_meter_canvas.config(width=risk_meter_tk.width(), height=risk_meter_tk.height())
-                self.risk_meter_canvas.create_image(0, 0, anchor=tk.NW, image=risk_meter_tk)
+        # Reset state
+        self.current_session_id = None
+        self.session_start_time = None
 
-            # Update factors text
-            factors_text = "Contributing Factors:\n" + "\n".join([f"- {k}: {v:.3f}" for k, v in factors.items()])
-            self.factors_label.config(text=factors_text)
-        elif self.risk_meter_canvas.winfo_exists():
-             # Clear risk meter if no results
-             self.risk_meter_canvas.delete("all")
-             self.risk_meter_canvas.create_text(100, 25, text="Risk: N/A", fill="black")
-             self.factors_label.config(text="Contributing Factors: N/A")
+        # Update UI
+        self.start_btn.config(state=tk.NORMAL if self.current_patient_id else tk.DISABLED)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.report_button.config(state=tk.NORMAL if self.llm_client and self.current_patient_id else tk.DISABLED) # Enable report gen after session
+        self.session_status_label.config(text="Status: Idle")
+        logger.info("Session stopped.")
 
+    def stop_session_threads(self):
+        """Safely stops all running threads."""
+        # Stop in reverse order of dependency/creation
+        if self.llm_thread and self.llm_thread.is_alive():
+            logger.debug("Stopping LLM thread...")
+            self.llm_thread.stop()
+            self.llm_thread.join(timeout=2)
+        self.llm_thread = None
 
-    def _update_genomic_display(self, genomic_result):
-        """Updates the Genomic Analysis tab with results."""
-        self.genomic_results_text.config(state=tk.NORMAL)
-        self.genomic_results_text.delete('1.0', tk.END)
-        if isinstance(genomic_result, dict) and 'error' in genomic_result:
-             self.genomic_results_text.insert(tk.END, f"Error: {genomic_result['error']}")
-        elif isinstance(genomic_result, dict):
-             # Pretty print the dictionary result
-             formatted_result = json.dumps(genomic_result, indent=4)
-             self.genomic_results_text.insert(tk.END, formatted_result)
-        else:
-             self.genomic_results_text.insert(tk.END, str(genomic_result)) # Fallback
-        self.genomic_results_text.config(state=tk.DISABLED)
-        logging.info("Updated genomic display.")
-        # Re-enable genomic button after completion (or handle errors)
-        if self.is_processing and self.current_patient_id:
-             self.genomic_trigger_button.config(state=tk.NORMAL)
+        if self.genomic_thread and self.genomic_thread.is_alive():
+            logger.debug("Stopping Genomic thread...")
+            self.genomic_thread.stop()
+            self.genomic_thread.join(timeout=2)
+        self.genomic_thread = None
 
+        if self.processing_thread and self.processing_thread.is_alive():
+            logger.debug("Stopping Processing thread...")
+            self.processing_thread.stop()
+            self.processing_thread.join(timeout=3)
+        self.processing_thread = None
 
-    def _update_llm_display(self, llm_result, target_widget, target_button):
-        """
-        Updates the specified Text widget with LLM results and re-enables the
-        corresponding button based on current state.
-        """
-        target_widget.config(state=tk.NORMAL)
-        target_widget.delete('1.0', tk.END)
-        target_widget.insert(tk.END, llm_result)
-        target_widget.config(state=tk.DISABLED)
-        logging.info("Updated LLM display.")
+        if self.video_thread and self.video_thread.is_alive():
+            logger.debug("Stopping Video thread...")
+            self.video_thread.stop()
+            self.video_thread.join(timeout=2)
+        self.video_thread = None
+        logger.debug("All threads stopped.")
 
-        # Re-enable the specific button that triggered the analysis, checking state
-        if target_button:
-            should_enable = False
-            if target_button == self.llm_trigger_button:
-                # Enable live button only if processing and patient selected
-                if self.is_processing and self.current_patient_id:
-                    should_enable = True
-            elif target_button == self.llm_history_button:
-                 # Enable history button only if a valid history session is selected
-                 if self.selected_history_session_id:
-                     should_enable = True
+    def check_queues(self):
+        """Periodically check queues for results from threads."""
+        try:
+            while not self.result_queue.empty():
+                result_type, data = self.result_queue.get_nowait()
 
-            if should_enable:
-                target_button.config(state=tk.NORMAL)
+                if result_type == "processed_frame":
+                    frame, metrics, risk_assessment_results = data
+                    self.update_video_display(frame)
+                    self.update_ocular_metrics_display(metrics)
+                    self.update_risk_display(risk_assessment_results)
+                    self.update_technical_display(metrics)
+                    self.last_metrics_update = metrics # Store latest full metrics
+                    self.last_risk_assessment = risk_assessment_results
+
+                elif result_type == "genomic_result":
+                    self.last_genomic_update = data
+                    self.update_genomic_display(data)
+                    # Potentially trigger LLM summary after genomic analysis?
+                    # self.trigger_llm_analysis()
+
+                elif result_type == "llm_result":
+                    analysis_type, analysis_text = data
+                    self.update_cds_display(analysis_text, analysis_type) # Update CDS section
+
+                elif result_type == "status_update":
+                    thread_name, status_msg = data
+                    logger.info(f"Status from {thread_name}: {status_msg}")
+                    # Update a general status bar if needed
+
+                elif result_type == "error":
+                     thread_name, error_msg = data
+                     logger.error(f"Error from {thread_name}: {error_msg}")
+                     messagebox.showerror(f"Thread Error ({thread_name})", error_msg, parent=self.root)
+                     # self.stop_session() # Consider stopping on critical errors
+
+                self.result_queue.task_done()
+
+        except queue.Empty:
+            pass # Normal
+        except Exception as e:
+            logger.error(f"Error processing result queue: {e}", exc_info=True)
+
+        # Update session duration if active
+        if self.session_active and self.session_start_time:
+            elapsed = time.time() - self.session_start_time
+            elapsed_str = time.strftime('%M:%S', time.gmtime(elapsed))
+            self.pat_info_session_dur.config(text=f"Session Duration: {elapsed_str}")
+
+        # Reschedule the check
+        self.root.after(50, self.check_queues) # Check every 50ms
+
+    def update_video_display(self, frame):
+        """Updates the video label with a new frame."""
+        if frame is None: return
+        try:
+            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img_pil = Image.fromarray(img)
+
+            # Resize to fit label while maintaining aspect ratio
+            lbl_w = self.video_label.winfo_width()
+            lbl_h = self.video_label.winfo_height()
+            if lbl_w <= 1 or lbl_h <= 1: return # Avoid division by zero if label not rendered yet
+
+            img_w, img_h = img_pil.size
+            ratio = min(lbl_w / img_w, lbl_h / img_h)
+            new_size = (int(img_w * ratio), int(img_h * ratio))
+
+            if new_size[0] > 0 and new_size[1] > 0:
+                img_resized = img_pil.resize(new_size, Image.Resampling.LANCZOS)
+                self.imgtk = ImageTk.PhotoImage(image=img_resized)
+                self.video_label.config(image=self.imgtk)
             else:
-                 # Ensure button remains disabled if conditions aren't met
-                 # (e.g., processing stopped while LLM was running for live analysis)
-                 target_button.config(state=tk.DISABLED)
+                 self.video_label.config(image=None) # Clear if size is invalid
 
+        except Exception as e:
+            logger.error(f"Error updating video display: {e}", exc_info=True)
+            self.video_label.config(image=None) # Clear image on error
 
-    # --- Analysis Triggers ---
-    def _trigger_genomic_analysis(self):
-        """Sends data to the genomic analysis thread."""
-        if not self.is_processing:
-            messagebox.showwarning("Not Processing", "Start processing before running genomic analysis.")
+    def update_ocular_metrics_display(self, metrics):
+        """Updates labels in Section 2: Ocular Biomarkers."""
+        if not metrics: return
+        self.oc_saccade_vel.config(text=f"Saccade Vel (°/s): {metrics.get('saccade_velocity_deg_s', 'N/A'):.1f}")
+        self.oc_fixation_stab.config(text=f"Fixation Stab (°): {metrics.get('fixation_stability_deg', 'N/A'):.2f}")
+        self.oc_blink_rate.config(text=f"Blink Rate (bpm): {metrics.get('blink_rate_bpm', 'N/A'):.1f}")
+        # TODO: Update Anti-saccade label when metric is available
+        # self.oc_anti_saccade.config(text=f"Anti-Saccade Err: {metrics.get('anti_saccade_error_rate', 'N/A')}")
+        # TODO: Update Fixation Stability Heatmap
+
+    def update_risk_display(self, risk_assessment_results):
+        """Updates Section 4: Combined Risk Assessment."""
+        if not risk_assessment_results: return
+        risk_level, reason, ocular_score, factors = risk_assessment_results
+
+        # Update Risk Meter
+        draw_risk_meter(self.risk_meter_canvas, ocular_score) # Use ocular score for the meter
+
+        # Update Classification and Reason Labels
+        level_str = risk_level.value if isinstance(risk_level, RiskLevel) else str(risk_level)
+        self.risk_classification_label.config(text=f"Risk Class: {level_str}")
+        self.risk_reason_label.config(text=f"Reason: {reason}")
+        # TODO: Update Confidence Metric label
+
+    def update_genomic_display(self, genomic_results):
+        """Updates Section 3: Genomic Analysis."""
+        if not genomic_results: return
+        self.gen_summary.config(text=f"BioNeMo Score: {genomic_results.get('genetic_risk_score', 'N/A'):.2f}x")
+
+        variants = genomic_results.get('variants_detected', [])
+        variant_text = f"{len(variants)} variants detected:\n"
+        variant_text += "\n".join([f"- {v['gene']}-{v['variant']}" for v in variants[:3]]) # Show top 3
+        if len(variants) > 3: variant_text += "\n..."
+
+        self.gen_variants_text.config(state=tk.NORMAL)
+        self.gen_variants_text.delete('1.0', tk.END)
+        self.gen_variants_text.insert('1.0', variant_text)
+        self.gen_variants_text.config(state=tk.DISABLED)
+
+        pathways = genomic_results.get('dominant_pathways', [])
+        self.gen_pathway_label.config(text=f"Affected Pathways: {', '.join(pathways)}")
+        # TODO: Update Pathway Visualization
+
+    def update_technical_display(self, metrics):
+        """Updates Section 7: Technical Performance Indicators."""
+        if not metrics: return
+        # TODO: Add Tracking Quality metric calculation/display
+        self.tech_distance.config(text=f"Distance (cm): {metrics.get('estimated_distance_cm', 'N/A'):.1f}")
+        # TODO: Add Calibration Status display
+
+    def update_cds_display(self, text, analysis_type="LLM Analysis"):
+        """Updates Section 6: Clinical Decision Support (using LLM results)."""
+        self.cds_findings_label.config(text=f"Automated Findings ({analysis_type}):")
+        self.cds_findings_text.config(state=tk.NORMAL)
+        self.cds_findings_text.delete('1.0', tk.END)
+        self.cds_findings_text.insert('1.0', text)
+        self.cds_findings_text.config(state=tk.DISABLED)
+        # TODO: Extract suggested actions or medication info if LLM provides structured output
+
+    def _clear_displays(self):
+        """Clears all dynamic data displays."""
+        # Ocular
+        self.oc_saccade_vel.config(text="Saccade Vel (°/s): -")
+        self.oc_fixation_stab.config(text="Fixation Stab (°): -")
+        self.oc_blink_rate.config(text="Blink Rate (bpm): -")
+        self.oc_anti_saccade.config(text="Anti-Saccade Err: -")
+        # TODO: Clear heatmap canvas
+        # Genomic
+        self.gen_summary.config(text="BioNeMo Summary: -")
+        self.gen_variants_text.config(state=tk.NORMAL); self.gen_variants_text.delete('1.0', tk.END); self.gen_variants_text.config(state=tk.DISABLED)
+        self.gen_pathway_label.config(text="Affected Pathways: -")
+        # TODO: Clear pathway canvas
+        # Risk
+        draw_risk_meter(self.risk_meter_canvas, 0.0) # Reset meter
+        self.risk_classification_label.config(text="Risk Class: -")
+        self.risk_reason_label.config(text="Reason: -")
+        self.risk_confidence_label.config(text="Confidence: -")
+        # Longitudinal
+        # TODO: Clear trend canvas
+        self.long_baseline_comp.config(text="Baseline Comparison: -")
+        self.long_population_comp.config(text="Population Comparison: -")
+        # CDS
+        self.cds_findings_label.config(text="Automated Findings:")
+        self.cds_findings_text.config(state=tk.NORMAL); self.cds_findings_text.delete('1.0', tk.END); self.cds_findings_text.config(state=tk.DISABLED)
+        self.cds_actions_label.config(text="Suggested Actions: -")
+        self.cds_medication_label.config(text="Medication Tracking: -")
+        # Technical
+        self.tech_tracking_qual.config(text="Tracking Quality: -")
+        self.tech_distance.config(text="Distance (cm): -")
+        self.tech_calibration.config(text="Calibration: N/A")
+        # Video
+        self.video_label.config(image=None) # Clear video feed
+
+    def generate_report(self):
+        """Triggers LLM to generate a clinical report based on last session data."""
+        if not self.llm_client:
+            messagebox.showwarning("LLM Not Configured", "OpenRouter API key not found. Cannot generate report.", parent=self.root)
             return
         if not self.current_patient_id:
-             messagebox.showwarning("No Patient", "Select a patient before running genomic analysis.")
+             messagebox.showwarning("No Patient", "Load a patient before generating a report.", parent=self.root)
              return
 
-        # Use the stored last risk level
-        if self.last_risk_level is None:
-             messagebox.showerror("Error", "No eye risk score calculated yet.")
+        # TODO: Load data from the *last completed* session for this patient
+        # For now, use the data stored from the last active session if available
+        if not self.last_metrics_update and not self.last_genomic_update:
+             messagebox.showwarning("No Data", "No session data available to generate a report.", parent=self.root)
              return
 
-        ethnicity = self.current_patient_info.get('ethnicity', 'default')
-        if not ethnicity: # Handle case where ethnicity might be None or empty string
-            ethnicity = 'default'
-            logging.warning("Patient ethnicity not set, using 'default' for genomic analysis.")
+        logger.info("Triggering LLM for Clinical Report Generation...")
+        # Combine available data
+        report_data = {
+            "patient_info": self.current_patient_info,
+            "ocular_metrics": self.last_metrics_update,
+            "risk_assessment": self.last_risk_assessment,
+            "genomic_analysis": self.last_genomic_update,
+        }
+        # Put data onto the LLM queue with a specific type
+        self.llm_queue.put(("generate_report", report_data))
+        self.update_cds_display("Generating clinical report...", "Status")
 
 
-        logging.info(f"Queueing genomic analysis for patient {self.current_patient_id}, ethnicity {ethnicity}, risk {self.last_risk_level:.3f}")
-        self.genomic_input_queue.put({'eye_risk_level': self.last_risk_level, 'ethnicity': ethnicity})
-        self.genomic_trigger_button.config(state=tk.DISABLED) # Disable button while running
-        # Clear previous results
-        self.genomic_results_text.config(state=tk.NORMAL)
-        self.genomic_results_text.delete('1.0', tk.END)
-        self.genomic_results_text.insert(tk.END, "Running genomic simulation...")
-        self.genomic_results_text.config(state=tk.DISABLED)
-
-
-    def _trigger_llm_analysis(self, use_history=False):
-        """
-        Triggers analysis by the OpenRouter LLM for either the live data
-        or a selected historical session.
-
-        Args:
-            use_history (bool): If True, use data from the selected historical session.
-                                Otherwise, use the latest live data.
-        """
-        target_button = self.llm_history_button if use_history else self.llm_trigger_button
-        target_text_widget = self.llm_results_text # Could have separate text widgets if desired
-
-        if use_history:
-            if not self.selected_history_session_id or not self.loaded_history_session_data:
-                 messagebox.showwarning("No History Selected", "Select a session from the history list first.")
-                 return
-            if not self.current_patient_id: # Should be set if history is loaded, but double-check
-                 messagebox.showwarning("No Patient", "Select the corresponding patient.")
-                 return
-        else: # Live analysis
-            if not self.is_processing:
-                messagebox.showwarning("Not Processing", "Start processing before running live LLM analysis.")
-                return
-            if not self.current_patient_id:
-                 messagebox.showwarning("No Patient", "Select a patient before running live LLM analysis.")
-                 return
-
-        if not self.openrouter_client.api_key:
-             messagebox.showerror("API Key Missing", "OpenRouter API key not configured.")
-             return
-
-        # --- Gather necessary data based on mode ---
-        patient_data = self.current_patient_info
-        eye_summary_data = None
-        eye_raw_data = None
-        # Use last known live genomic result for both live and history analysis for now
-        # A more advanced implementation might store genomic snapshots with sessions.
-        genomic_data = self.last_genomic_result if self.last_genomic_result else {'error': 'Genomic analysis not run or failed'}
-
-        if use_history:
-            logging.info(f"Gathering data for LLM analysis from historical session ID: {self.selected_history_session_id}")
-            if not isinstance(self.loaded_history_session_data, list) or not self.loaded_history_session_data:
-                 messagebox.showerror("Error", "Loaded historical session data is invalid or empty.")
-                 target_button.config(state=tk.NORMAL) # Re-enable button
-                 return
-
-            # --- Calculate representative data from history log ---
-            valid_entries = [e for e in self.loaded_history_session_data if e.get('raw_metrics') and e.get('risk_results')]
-            if not valid_entries:
-                 messagebox.showwarning("Missing Data", "No valid metric entries found in the selected historical session log.")
-                 target_button.config(state=tk.NORMAL) # Re-enable button
-                 return
-
-            # Example: Calculate averages
-            risk_values = [e['risk_results'][0] for e in valid_entries if e.get('risk_results') and e['risk_results'][0] is not None]
-            avg_risk = np.mean(risk_values) if risk_values else None
-
-            # Average raw metrics (handle potential None values)
-            # Use keys from the first valid entry's raw_metrics if available
-            avg_raw_metrics = {}
-            if valid_entries[0].get('raw_metrics'):
-                raw_metric_keys = valid_entries[0]['raw_metrics'].keys()
-                for key in raw_metric_keys:
-                    values = [e['raw_metrics'].get(key) for e in valid_entries if e.get('raw_metrics') and e['raw_metrics'].get(key) is not None]
-                    if values and isinstance(values[0], (int, float)): # Only average numeric types
-                        avg_raw_metrics[key] = np.mean(values)
-                    elif values: # Keep last known non-numeric value (like 'active_eye_mode')
-                        avg_raw_metrics[key] = values[-1]
-                    else:
-                        avg_raw_metrics[key] = None # Or 'N/A'
-
-            # Factors are harder to average meaningfully, maybe take factors from highest risk entry?
-            # For simplicity, just note that factors are not averaged.
-            eye_summary_data = {'risk_level': avg_risk if avg_risk is not None and not np.isnan(avg_risk) else None,
-                                'contributing_factors': {'Note': 'Factors not averaged from history'}}
-            eye_raw_data = avg_raw_metrics
-
-        else: # Use live data
-            logging.info("Gathering latest live data for LLM analysis.")
-            if not self.last_eye_metrics_summary or not self.last_eye_metrics_raw:
-                messagebox.showwarning("Missing Data", "Live eye tracking data not available yet for LLM analysis.")
-                # Don't re-enable button here, let the calling context handle it if needed
-                return
-            eye_summary_data = self.last_eye_metrics_summary
-            eye_raw_data = self.last_eye_metrics_raw
-
-        # Check if essential eye data was gathered successfully
-        if eye_summary_data is None or eye_raw_data is None:
-             messagebox.showerror("Error", "Could not gather necessary eye data for LLM analysis.")
-             target_button.config(state=tk.NORMAL) # Re-enable button as the process failed early
-             return
-
-        # --- Trigger LLM ---
-        logging.info(f"Triggering LLM analysis for patient {self.current_patient_id} (History: {use_history})")
-        target_button.config(state=tk.DISABLED) # Disable the correct button
-        target_text_widget.config(state=tk.NORMAL)
-        target_text_widget.delete('1.0', tk.END)
-        target_text_widget.insert(tk.END, "Requesting LLM analysis...")
-        target_text_widget.config(state=tk.DISABLED)
-
-        # Run LLM call in a separate thread to avoid blocking GUI
-        def llm_task():
-            analysis = self.openrouter_client.analyze_combined_data(
-                eye_metrics_summary=eye_summary_data,
-                eye_metrics_raw=eye_raw_data,
-                genomic_results=genomic_data, # Use the potentially updated genomic_data
-                patient_info=patient_data
-            )
-            # Schedule UI update back in the main thread
-            # Pass the target widget and button to re-enable
-            self.root.after(0, self._update_llm_display, analysis, target_text_widget, target_button)
-
-        llm_thread = threading.Thread(target=llm_task, daemon=True)
-        llm_thread.start()
-
-
-    # --- Window Closing ---
     def _on_close(self):
         """Handles window closing event."""
-        logging.info("Close button clicked.")
-        if self.is_processing:
-            if messagebox.askokcancel("Quit", "Processing is active. Stop processing and quit?"):
-                self.stop_processing()
-                # Wait a moment for threads to potentially signal stop
-                time.sleep(0.5)
+        logger.info("Close button clicked.")
+        if self.session_active:
+            if messagebox.askyesno("Session Active", "A session is currently running. Stop session and exit?", parent=self.root):
+                self.stop_session()
                 self.root.destroy()
             else:
                 return # Don't close if user cancels
         else:
-             # Ensure DB connection for main thread is closed if open
-             self.storage.close_connection()
-             self.root.destroy()
+            # Stop threads just in case (should be stopped already)
+            self.stop_session_threads()
+            self.root.destroy()
 
+    def toggle_mesh_view(self):
+        """Toggles between normal webcam view and mesh overlay view."""
+        self.show_mesh = not self.show_mesh
+        if self.processing_thread:
+            self.processing_thread.toggle_mesh(self.show_mesh)
+        self.webcam_toggle.config(text="Toggle Normal View" if self.show_mesh else "Toggle Mesh View")
 
+# --- Main Application Entry Point ---
 if __name__ == '__main__':
     root = tk.Tk()
     app = Dashboard(root)
     root.mainloop()
+    logger.info("Application exited.")
