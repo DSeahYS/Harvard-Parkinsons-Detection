@@ -33,6 +33,7 @@ Detects neurological markers 5-7 years before motor symptoms appear
 
 ## Features ✨
 Component	Capabilities
+Dashboard     All in 1 UI. (Currently broken)
 Eye Tracking	Real-time measurement of saccadic velocity (400-600°/s norm), fixation stability, vertical saccades with ethnicity compensation
 Genomic Simulation	Singapore-specific simulation of LRRK2, GBA, and SNCA variants with ethnicity adjustments for Chinese, Malay, and Indian populations
 Medication Detection	Detects Levodopa efficacy through pupillary hippus analysis
@@ -61,7 +62,6 @@ Risk scoring system aligns with MOH clinical guidelines
  ![image](https://github.com/user-attachments/assets/cc8359d9-1459-4811-b085-b6fd85761473)
  ![image](https://github.com/user-attachments/assets/f181eb41-6635-4a95-9160-773c3617ae24)
 
- 
 ## Contributors 🤝
 Team Lead: Dave Seah Yong Sheng
 Physical Prototype: Timothy Wong
