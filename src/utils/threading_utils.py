@@ -3,315 +3,405 @@ import threading
 import time
 import queue
 import logging
+import numpy as np
+import os # Added import
 
-from ..models.eye_tracker import EyeTracker
-from ..models.pd_detector import PDDetector
-# Import other necessary components if needed, e.g., BioNeMoClient
+# --- Project Imports ---
+# Use absolute imports assuming 'src' is in PYTHONPATH or run via `python -m src.main`
+try:
+    from ..models.eye_tracker import EyeTracker
+    from ..models.pd_detector import PDDetector
+    from ..genomic.bionemo_client import BioNeMoRiskAssessor
+    from ..llm.openrouter_client import OpenRouterClient
+except ImportError:
+    # Fallback for direct execution or different project structure
+    # This might indicate running the script directly instead of as part of the package
+    print("Warning: Could not perform relative imports in threading_utils. Assuming models are in sibling directories.")
+    # Add alternative import paths if necessary, or rely on PYTHONPATH
+    # Example:
+    # script_dir = os.path.dirname(__file__)
+    # models_dir = os.path.join(script_dir, '..', 'models')
+    # sys.path.append(models_dir)
+    # from eye_tracker import EyeTracker
+    # ... etc.
+    # For simplicity, we'll assume the package structure is correct for now.
+    # If errors persist, the execution context needs review.
+    pass # Let it fail later if imports truly don't work
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 
+# Configure logging (might be overridden by main)
+# log_level = os.environ.get('LOG_LEVEL', 'INFO').upper() # Moved config to main.py
+# logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+# --- Camera Streaming Thread ---
 class RTSPCameraStream:
     """
-    Dedicated thread for capturing frames from a camera source (like cv2.VideoCapture)
-    to prevent blocking the main processing or GUI thread. Uses a lock for safe
-    frame access.
+    Dedicated thread for reading frames from a camera source (like webcam or RTSP).
+    Uses a queue to pass frames to the processing thread.
     """
-    def __init__(self, src=0, name="CameraThread"):
-        """
-        Initializes the camera stream.
-
-        Args:
-            src (int or str): The source index or path for cv2.VideoCapture.
-            name (str): Name for the thread.
-        """
-        self.stream = cv2.VideoCapture(src)
-        if not self.stream.isOpened():
-            logging.error(f"Failed to open camera source: {src}")
-            raise ValueError(f"Could not open video source: {src}")
-
-        self.stopped = False
-        self.frame = None
-        self.frame_lock = threading.Lock()
-        self.thread = threading.Thread(target=self.update, name=name, daemon=True)
-        logging.info(f"RTSPCameraStream initialized for source: {src}")
+    def __init__(self, source=0, max_queue_size=10):
+        self.source = source
+        self.cap = None
+        self.frame_queue = queue.Queue(maxsize=max_queue_size)
+        self._stop_event = threading.Event()
+        self._thread = None
+        self.is_running = False
 
     def start(self):
-        """Starts the frame reading thread."""
-        self.stopped = False
-        self.thread.start()
-        logging.info("Camera thread started.")
-        return self
+        logger.info(f"Attempting to open camera source: {self.source}")
+        try:
+            self.cap = cv2.VideoCapture(self.source)
+            if not self.cap.isOpened():
+                raise IOError(f"Cannot open camera source: {self.source}")
+            logger.info(f"Camera source {self.source} opened successfully.")
+            self.is_running = True
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._update, name=f"CameraThread-{self.source}", daemon=True)
+            self._thread.start()
+            logger.info(f"Camera thread started for source: {self.source}.")
+        except Exception as e:
+            logger.error(f"Failed to start camera stream for source {self.source}: {e}", exc_info=True)
+            self.is_running = False
+            if self.cap:
+                self.cap.release()
+            self.cap = None
+        return self # Return self for chaining
 
-    def update(self):
-        """Continuously reads frames from the stream."""
-        logging.info("Camera update loop running...")
-        while not self.stopped:
-            ret, frame = self.stream.read()
+    def _update(self):
+        logger.info("Camera update loop running...")
+        while not self._stop_event.is_set() and self.cap.isOpened():
+            ret, frame = self.cap.read()
             if not ret:
-                logging.warning("Camera stream returned False (end of stream or error). Stopping.")
-                self.stop()
-                break
+                logger.warning(f"Camera source {self.source}: Failed to grab frame or stream ended.")
+                # Optional: Attempt to reopen stream?
+                time.sleep(0.5) # Wait before retrying or exiting
+                # For now, just stop if we can't read.
+                # self.stop() # Let the main loop handle stopping based on is_running
+                break # Exit loop if frame read fails
 
-            with self.frame_lock:
-                self.frame = frame
-        # Release stream resource when thread stops
-        self.stream.release()
-        logging.info("Camera stream released.")
+            if not self.frame_queue.full():
+                self.frame_queue.put(frame)
+            else:
+                # If queue is full, discard oldest frame and add newest
+                try:
+                    self.frame_queue.get_nowait() # Discard oldest
+                    self.frame_queue.put(frame) # Add newest
+                    # logger.warning("Camera frame queue was full. Discarded oldest frame.") # Can be noisy
+                except queue.Empty:
+                    pass # Should not happen if full, but handle race condition
+
+            # Add a small sleep to prevent busy-waiting if frame rate is low
+            # Adjust based on expected camera FPS
+            time.sleep(0.01) # Approx 100 FPS max read rate
+
+        # Cleanup when loop exits
+        if self.cap:
+            self.cap.release()
+        self.is_running = False
+        logger.info(f"Camera stream {self.source} released.")
 
     def read(self):
-        """
-        Returns the latest frame captured by the thread.
-
-        Returns:
-            np.ndarray or None: The latest frame (copied for safety), or None if no frame
-                                is available or the stream hasn't started/is stopped.
-        """
-        with self.frame_lock:
-            # Return a copy to prevent race conditions if the frame is modified elsewhere
-            frame_copy = self.frame.copy() if self.frame is not None else None
-        return frame_copy
+        """Reads the latest frame from the queue (non-blocking)."""
+        try:
+            return self.frame_queue.get_nowait()
+        except queue.Empty:
+            return None # No new frame available
 
     def stop(self):
-        """Signals the thread to stop."""
-        logging.info("Stopping camera thread...")
-        self.stopped = True
-        # Wait briefly for the thread to potentially finish its current loop iteration
-        if self.thread.is_alive():
-             self.thread.join(timeout=1.0) # Wait max 1 sec for thread to stop gracefully
-             if self.thread.is_alive():
-                 logging.warning("Camera thread did not stop gracefully within timeout.")
+        logger.info(f"Stopping camera thread for source: {self.source}...")
+        self._stop_event.set()
+        # Wait for thread to finish
+        if self._thread is not None and self._thread.is_alive():
+             self._thread.join(timeout=2) # Wait up to 2 seconds
+             if self._thread.is_alive():
+                  logger.warning(f"Camera thread {self.source} did not stop gracefully.")
+        logger.info(f"Camera thread {self.source} stopped.")
+        # Ensure cap is released even if thread join times out
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+            logger.info(f"Camera capture {self.source} explicitly released after stop.")
+        self.is_running = False
 
 
+# --- Frame Processing Thread ---
 class ProcessingThread(threading.Thread):
     """
-    Dedicated thread for running the eye tracking and PD detection pipeline.
-    Reads frames from a camera stream and puts results into a queue.
+    Thread for processing video frames using EyeTracker and PDDetector.
+    Receives frames from a camera queue, puts results onto a result queue.
     """
-    def __init__(self, camera_stream, result_queue, eye_tracker: EyeTracker, pd_detector: PDDetector, name="ProcessingThread"):
-        """
-        Initializes the processing thread.
-
-        Args:
-            camera_stream (RTSPCameraStream): The camera stream instance to read frames from.
-            result_queue (queue.Queue): Queue to put the processing results into
-                                        (e.g., (processed_frame, metrics, risk_results)).
-            eye_tracker (EyeTracker): Instance of the eye tracker model.
-            pd_detector (PDDetector): Instance of the Parkinson's detector model.
-            name (str): Name for the thread.
-        """
-        super().__init__(name=name, daemon=True)
-        self.camera_stream = camera_stream
-        self.result_queue = result_queue
+    def __init__(self, eye_tracker: EyeTracker, pd_detector: PDDetector, frame_queue: queue.Queue, result_queue: queue.Queue, genomic_trigger_queue: queue.Queue, debug_mode=True):
+        super().__init__(name="ProcessingThread", daemon=True)
         self.eye_tracker = eye_tracker
         self.pd_detector = pd_detector
-        self.running = False
+        self.frame_queue = frame_queue
+        self.result_queue = result_queue
+        self.genomic_trigger_queue = genomic_trigger_queue
         self._stop_event = threading.Event()
-        logging.info("ProcessingThread initialized.")
+        self.debug_mode = debug_mode
+        self.session_active = False
+        self.raw_log = [] # Store raw metrics for saving at session end
 
     def run(self):
-        """The main loop for the processing thread."""
-        logging.info("Processing thread running...")
-        self.running = True
+        logger.info("Processing thread running...")
+        frame_count = 0
+        last_genomic_trigger_time = 0
+        GENOMIC_TRIGGER_INTERVAL = 5 # seconds
+
         while not self._stop_event.is_set():
-            frame = self.camera_stream.read()
-            if frame is None:
-                # If camera stopped or hasn't provided a frame yet, wait briefly
-                time.sleep(0.01)
-                continue
-
             try:
-                # Process frame using EyeTracker
-                # Unpack all 4 return values from process_frame
-                output_frame, original_frame_rgb, metrics, face_landmarks = self.eye_tracker.process_frame(frame)
+                frame = self.frame_queue.get(timeout=0.5) # Wait up to 0.5s for a frame
+                if frame is None: # Check for sentinel value if used
+                    continue
 
-                risk_results = None
-                if metrics:
-                    # Get risk assessment from PDDetector
-                    # Assuming ethnicity needs to be passed; get it from patient profile? Placeholder for now.
-                    current_ethnicity = "default" # TODO: Get actual ethnicity
-                    risk_level, factors = self.pd_detector.predict(metrics, ethnicity=current_ethnicity)
-                    risk_results = (risk_level, factors)
+                timestamp = time.time()
 
-                # Put results into the queue for the main (GUI) thread
-                # Include raw metrics and face landmarks if needed by other components (e.g., BioNeMo, visualization)
-                result_package = {
-                    'processed_frame': output_frame, # Use the frame potentially with drawings
-                    'raw_metrics': metrics,
-                    'risk_results': risk_results,
-                    'face_landmarks': face_landmarks # Pass raw landmarks if needed downstream
-                }
-                self.result_queue.put(result_package)
+                # --- Eye Tracking ---
+                processed_frame, eye_metrics, _ = self.eye_tracker.process_frame(frame)
 
+                if eye_metrics:
+                    # --- PD Risk Detection ---
+                    # Pass a default genetic_risk_score of 1.0 (baseline)
+                    pd_risk_info = self.pd_detector.assess_risk(eye_metrics, genetic_risk_score=1.0)
+
+                    # --- Combine Results ---
+                    combined_metrics = {
+                        "timestamp": timestamp,
+                        "eye_metrics": eye_metrics,
+                        "pd_risk": pd_risk_info,
+                        # Genomic results will be added later via another queue item
+                    }
+
+                    # Store raw data if session is active
+                    if self.session_active:
+                        self.raw_log.append(combined_metrics)
+
+                    # Put processed frame and combined metrics onto the result queue
+                    try:
+                        # Pass the processed frame (with or without overlay) and the metrics dict
+                        self.result_queue.put(("processed_frame", (processed_frame, combined_metrics)), block=False)
+                    except queue.Full:
+                        logger.warning("Result queue is full. Dropping processed frame/metrics.")
+
+                    # --- Trigger Genomic Analysis Periodically ---
+                    if self.session_active and (timestamp - last_genomic_trigger_time > GENOMIC_TRIGGER_INTERVAL):
+                         if not self.genomic_trigger_queue.full():
+                              # Send necessary data (e.g., current eye risk level)
+                              trigger_data = {'eye_risk_level': pd_risk_info.get('risk_level', 0.0)}
+                              self.genomic_trigger_queue.put(trigger_data, block=False)
+                              last_genomic_trigger_time = timestamp
+                              logger.debug("Triggered genomic analysis.")
+                         else:
+                              logger.warning("Genomic trigger queue full. Skipping trigger.")
+
+                else:
+                     # If no eye metrics, still put the original/processed frame for display
+                     try:
+                          self.result_queue.put(("processed_frame", (processed_frame, {})), block=False) # Send frame with empty metrics
+                     except queue.Full:
+                          logger.warning("Result queue is full. Dropping frame.")
+
+
+                self.frame_queue.task_done() # Mark frame as processed
+
+            except queue.Empty:
+                # No frame received within timeout, continue loop
+                continue
             except Exception as e:
-                logging.error(f"Error during frame processing: {e}", exc_info=True)
-                # Optionally put an error message in the queue or handle differently
-                time.sleep(0.1) # Avoid spamming errors
+                logger.error(f"Error in processing thread: {e}", exc_info=True)
+                # Put error onto result queue for UI to handle
+                try:
+                    self.result_queue.put(("error", (self.name, str(e))), block=False)
+                except queue.Full:
+                     logger.error("Result queue full while trying to report processing error.")
+                time.sleep(0.1) # Avoid tight loop on continuous errors
 
-        self.running = False
-        try:
-            self.eye_tracker.close() # Release MediaPipe resources
-        except Exception as e:
-            logging.warning(f"Error closing eye tracker: {e}")
-        logging.info("Processing thread stopped.")
-        
-    def reset(self):
-        """Resets the processor with fresh resources."""
-        self.stop()
-        self.eye_tracker.reset()
-        self._stop_event.clear()
+        logger.info("Processing thread stopped.")
+
+    def start_session(self):
+        self.session_active = True
+        self.raw_log = [] # Clear log for new session
+        logger.info("Processing thread session started.")
+
+    def stop_session(self):
+        self.session_active = False
+        logger.info("Processing thread session stopped.")
+        # Log might be retrieved by main thread after stopping
+
+    def get_raw_log(self):
+        return self.raw_log
+
+    def set_debug_mode(self, is_debug):
+        self.debug_mode = is_debug
+        logger.info(f"Processing thread debug mode set to {is_debug}")
 
     def stop(self):
-        """Signals the processing thread to stop."""
-        logging.info("Stopping processing thread...")
+        logger.info("Stopping processing thread...")
         self._stop_event.set()
 
 
+# --- Genomic Analysis Thread ---
 class GenomicAnalysisThread(threading.Thread):
     """
-    Dedicated thread for running potentially long-running genomic analysis.
-    Receives necessary data via one queue and puts results into another.
+    Thread for running simulated genomic analysis using BioNeMoClient.
+    Triggered by items in genomic_trigger_queue, puts results onto result_queue.
     """
-    def __init__(self, input_queue, output_queue, bionemo_client, name="GenomicThread"):
-        """
-        Initializes the genomic analysis thread.
-
-        Args:
-            input_queue (queue.Queue): Queue to receive data needed for analysis
-                                       (e.g., {'eye_risk_level': float, 'ethnicity': str}).
-            output_queue (queue.Queue): Queue to put the genomic analysis results into.
-            bionemo_client: Instance of the BioNeMo client (or similar).
-            name (str): Name for the thread.
-        """
-        super().__init__(name=name, daemon=True)
-        self.input_queue = input_queue
-        self.output_queue = output_queue
+    def __init__(self, bionemo_client: BioNeMoRiskAssessor, trigger_queue: queue.Queue, result_queue: queue.Queue, ethnicity: str):
+        super().__init__(name="GenomicAnalysisThread", daemon=True)
         self.bionemo_client = bionemo_client
+        self.trigger_queue = trigger_queue
+        self.result_queue = result_queue
+        self.ethnicity = ethnicity # Store ethnicity for analysis
         self._stop_event = threading.Event()
-        logging.info("GenomicAnalysisThread initialized.")
+        self.session_active = False
 
     def run(self):
-        """The main loop for the genomic analysis thread."""
-        logging.info("Genomic analysis thread running...")
+        logger.info("Genomic analysis thread running...")
         while not self._stop_event.is_set():
             try:
-                # Wait for input data (blocking)
-                analysis_input = self.input_queue.get(timeout=1.0) # Timeout to allow checking stop event
+                # Wait for a trigger event (with data like eye risk level)
+                trigger_data = self.trigger_queue.get(timeout=1.0)
+                if trigger_data is None: # Sentinel value check (optional)
+                    continue
 
-                if analysis_input is None: # Sentinel value to stop
-                    logging.info("Received None, stopping genomic analysis thread.")
-                    break
+                if not self.session_active:
+                     logger.debug("Genomic thread received trigger but session not active. Ignoring.")
+                     self.trigger_queue.task_done()
+                     continue
 
-                eye_risk = analysis_input.get('eye_risk_level')
-                ethnicity = analysis_input.get('ethnicity')
+                logger.debug(f"Genomic thread received trigger data: {trigger_data}")
+                eye_risk_level = trigger_data.get('eye_risk_level', 0.0)
 
-                if eye_risk is not None and ethnicity is not None:
-                    logging.info(f"Performing genomic analysis for ethnicity: {ethnicity}, eye risk: {eye_risk:.3f}")
-                    # Perform the potentially long-running analysis
-                    genomic_results = self.bionemo_client.analyze_genomics(
-                        eye_risk_level=eye_risk,
-                        ethnicity=ethnicity
-                    )
-                    # Put results in the output queue
-                    self.output_queue.put(genomic_results)
-                else:
-                    logging.warning("Genomic analysis input missing required data (eye_risk_level or ethnicity).")
+                # Perform the simulation
+                genomic_results = self.bionemo_client.simulate_genomics(
+                    eye_risk_level=eye_risk_level,
+                    ethnicity=self.ethnicity
+                )
 
-                self.input_queue.task_done() # Signal that the item is processed
+                # Put results onto the main result queue
+                try:
+                    self.result_queue.put(("genomic_result", genomic_results), block=False)
+                    logger.info("Genomic analysis complete, results queued.")
+                except queue.Full:
+                    logger.warning("Result queue full. Discarding genomic analysis results.")
+
+                self.trigger_queue.task_done()
 
             except queue.Empty:
-                # Timeout occurred, just loop again to check stop event
+                # Timeout waiting for trigger, normal operation
                 continue
             except Exception as e:
-                logging.error(f"Error during genomic analysis: {e}", exc_info=True)
-                # Optionally put an error message in the output queue
-                self.output_queue.put({'error': str(e)})
-                # Ensure task_done is called even if there's an error processing the item
-                if 'analysis_input' in locals() and analysis_input is not None:
-                     self.input_queue.task_done()
+                logger.error(f"Error in genomic analysis thread: {e}", exc_info=True)
+                try:
+                    self.result_queue.put(("error", (self.name, str(e))), block=False)
+                except queue.Full:
+                     logger.error("Result queue full while trying to report genomic analysis error.")
+                time.sleep(1) # Pause after error
+
+        logger.info("Genomic analysis thread stopped.")
+
+    def start_session(self):
+        self.session_active = True
+        # Clear the trigger queue at the start of a session?
+        while not self.trigger_queue.empty():
+            try: self.trigger_queue.get_nowait()
+            except queue.Empty: break
+        logger.info("Genomic thread session started.")
 
 
-        logging.info("Genomic analysis thread stopped.")
+    def stop_session(self):
+        self.session_active = False
+        logger.info("Genomic thread session stopped.")
+
+    def update_ethnicity(self, ethnicity):
+         self.ethnicity = ethnicity
+         logger.info(f"Genomic thread ethnicity updated to: {ethnicity}")
 
     def stop(self):
-        """Signals the genomic analysis thread to stop."""
-        logging.info("Stopping genomic analysis thread...")
+        logger.info("Stopping genomic analysis thread...")
         self._stop_event.set()
-        # Put a sentinel value in the queue to unblock the get() call if it's waiting
-        self.input_queue.put(None)
-
-# Example of how to use (usually instantiated in the main application/dashboard)
-if __name__ == '__main__':
-    print("Testing threading utilities...")
-
-    # Dummy components for testing
-    class MockEyeTracker:
-        def process_frame(self, frame):
-            print("MockEyeTracker processing frame...")
-            time.sleep(0.05) # Simulate work
-            return frame, {'saccade_velocity': 100, 'fixation_stability': 0.5, 'blink_rate': 15}, None
-        def close(self): print("MockEyeTracker closed.")
-
-    class MockPDDetector:
-        def predict(self, metrics, ethnicity):
-            print(f"MockPDDetector predicting for {ethnicity}...")
-            time.sleep(0.02) # Simulate work
-            return 0.45, {'factor1': 0.2, 'factor2': 0.25}
-
-    class MockBioNeMo:
-         def analyze_genomics(self, eye_risk_level, ethnicity):
-             print(f"MockBioNeMo analyzing for {ethnicity}, risk {eye_risk_level:.2f}...")
-             time.sleep(0.5) # Simulate longer work
-             return {'simulated_risk': eye_risk_level * 0.5, 'ethnicity': ethnicity}
+        # Optionally put a sentinel value to unblock the queue.get()
+        # try:
+        #     self.trigger_queue.put(None, block=False)
+        # except queue.Full:
+        #     pass
 
 
-    results_q = queue.Queue()
-    genomic_in_q = queue.Queue()
-    genomic_out_q = queue.Queue()
+# --- LLM Analysis Thread ---
+class LLMAnalysisThread(threading.Thread):
+    """
+    Thread for handling potentially long-running LLM API calls.
+    Takes requests from llm_queue, puts results onto result_queue.
+    """
+    def __init__(self, llm_client: OpenRouterClient, request_queue: queue.Queue, result_queue: queue.Queue):
+        super().__init__(name="LLMAnalysisThread", daemon=True)
+        self.llm_client = llm_client
+        self.request_queue = request_queue
+        self.result_queue = result_queue
+        self._stop_event = threading.Event()
 
-    try:
-        cam = RTSPCameraStream(src=0).start() # Use default webcam
-        time.sleep(2) # Allow camera to warm up
-
-        proc_thread = ProcessingThread(cam, results_q, MockEyeTracker(), MockPDDetector())
-        gen_thread = GenomicAnalysisThread(genomic_in_q, genomic_out_q, MockBioNeMo())
-
-        proc_thread.start()
-        gen_thread.start()
-
-        # Simulate main loop getting results
-        for i in range(10):
-            print(f"\nMain loop iteration {i+1}")
+    def run(self):
+        logger.info("LLM analysis thread running...")
+        while not self._stop_event.is_set():
             try:
-                result = results_q.get(timeout=1.0)
-                print(f"  Got processing result: Risk={result['risk_results'][0] if result['risk_results'] else 'N/A'}")
+                # Wait for an analysis request
+                request_data = self.request_queue.get(timeout=1.0)
+                if request_data is None: # Sentinel check
+                    continue
 
-                # Occasionally trigger genomic analysis
-                if i % 4 == 0 and result.get('risk_results'):
-                    print("  Triggering genomic analysis...")
-                    genomic_in_q.put({'eye_risk_level': result['risk_results'][0], 'ethnicity': 'test_ethnicity'})
+                # Handle both tuple and dictionary formats
+                if isinstance(request_data, tuple) and len(request_data) == 2:
+                    # If it's a tuple, unpack it directly
+                    prompt_type, data_payload = request_data
+                elif isinstance(request_data, dict):
+                    # If it's a dictionary, get the values using keys
+                    prompt_type = request_data.get("prompt_type")
+                    data_payload = request_data.get("data")
+                else:
+                    logger.warning(f"Invalid LLM request format: {type(request_data)}")
+                    self.request_queue.task_done()
+                    continue
+
+                if not prompt_type or data_payload is None:
+                    logger.warning("Invalid LLM request received (missing type or data).")
+                    self.request_queue.task_done()
+                    continue
+
+                logger.info(f"LLM thread received request for: {prompt_type}")
+
+                # Call the LLM client
+                analysis_result = self.llm_client.generate_summary(prompt_type, data_payload)
+
+                # Put the result or error message onto the main result queue
+                try:
+                    # Tag the result with the type of analysis performed
+                    self.result_queue.put(("llm_result", (prompt_type, analysis_result)), block=False)
+                    logger.info(f"LLM analysis for '{prompt_type}' complete, results queued.")
+                except queue.Full:
+                    logger.warning(f"Result queue full. Discarding LLM analysis result for '{prompt_type}'.")
+
+                self.request_queue.task_done()
 
             except queue.Empty:
-                print("  Processing queue empty.")
+                # Timeout waiting for request, normal operation
+                continue
+            except Exception as e:
+                logger.error(f"Error in LLM analysis thread: {e}", exc_info=True)
+                try:
+                    # Report error back to UI
+                    self.result_queue.put(("error", (self.name, f"LLM analysis failed: {e}")), block=False)
+                except queue.Full:
+                     logger.error("Result queue full while trying to report LLM analysis error.")
+                time.sleep(1) # Pause after error
 
-            # Check for genomic results
-            try:
-                gen_result = genomic_out_q.get_nowait()
-                print(f"  Got genomic result: {gen_result}")
-            except queue.Empty:
-                pass # No genomic result yet
+        logger.info("LLM analysis thread stopped.")
 
-            time.sleep(0.1)
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-    finally:
-        print("\nStopping threads...")
-        if 'cam' in locals(): cam.stop()
-        if 'proc_thread' in locals(): proc_thread.stop()
-        if 'gen_thread' in locals(): gen_thread.stop()
-
-        # Wait for threads to finish
-        if 'proc_thread' in locals() and proc_thread.is_alive(): proc_thread.join(timeout=2)
-        if 'gen_thread' in locals() and gen_thread.is_alive(): gen_thread.join(timeout=2)
-
-        print("Threads stopped.")
+    def stop(self):
+        logger.info("Stopping LLM analysis thread...")
+        self._stop_event.set()
+        # Optionally put a sentinel value to unblock the queue.get()
+        # try:
+        #     self.request_queue.put(None, block=False)
+        # except queue.Full:
+        #     pass
