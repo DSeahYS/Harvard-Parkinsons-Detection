@@ -1,254 +1,293 @@
 import numpy as np
-from ..utils.cycle_buffer import CycleBuffer # Relative import
-import time
+import logging
+from enum import Enum
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class RiskLevel(Enum):
+    LOW = "Low"
+    MODERATE = "Moderate"
+    HIGH = "High"
 
 class PDDetector:
     """
-    Assesses Parkinson's Disease risk based on ocular biomarkers and trends.
+    Assesses Parkinson's Disease risk by combining ocular biomarkers
+    and genetic risk scores based on specified thresholds and weights.
     """
-    def __init__(self, history_days_velocity=7, history_days_fixation=30):
+    def __init__(self, baseline_blink_rate=18, # Typical average blink rate
+                       saccade_norm_range=(50, 600), # deg/s, wider range for normalization
+                       stability_norm_range=(0.1, 3.0), # deg, wider range for normalization
+                       blink_norm_range=(5, 35) # bpm, wider range for normalization
+                       ):
         """
         Initializes the PDDetector.
 
         Args:
-            history_days_velocity (int): Number of days to track for velocity trends.
-            history_days_fixation (int): Number of days to track for fixation trends.
+            baseline_blink_rate (float): Expected normal blink rate (blinks per minute) for deviation calculation.
+            saccade_norm_range (tuple): Min/Max expected saccade velocity (deg/s) for normalization.
+            stability_norm_range (tuple): Min/Max expected fixation stability (deg) for normalization.
+            blink_norm_range (tuple): Min/Max expected blink rate (bpm) for normalization.
         """
-        # --- Tunable Weights for Biomarkers ---
-        # These weights should be determined based on clinical research/data.
-        # Example weights (summing doesn't necessarily have to be 1):
+        # --- Weights for Ocular Risk Score Component ---
+        # As specified: Saccade Vel (Inv): 0.6, Fixation Stab: 0.25, Blink Rate Dev: 0.15
         self.weights = {
-            'saccade_velocity_inv': 0.3,  # Inverse: Lower velocity might indicate higher risk
-            'fixation_stability': 0.4,    # Higher instability might indicate higher risk
-            'blink_rate_deviation': 0.2,  # Deviation from a baseline norm
-            'vertical_saccade_ratio': 0.1 # Ratio of vertical to horizontal velocity (example)
-            # Add other relevant weighted metrics
+            'saccade_velocity_inv': 0.6,
+            'fixation_stability': 0.25,
+            'blink_rate_deviation': 0.15,
         }
-        # Define a 'normal' or baseline blink rate (e.g., blinks per minute)
-        self.baseline_blink_rate = 15 # Example baseline
+        self.baseline_blink_rate = baseline_blink_rate
 
-        # --- Longitudinal Trend Tracking ---
-        # Store daily averages. Maxlen assumes one entry per day.
-        # In a real application, these would be loaded/saved from storage.
-        self.daily_avg_saccade_velocity = CycleBuffer(maxlen=history_days_velocity)
-        self.daily_avg_fixation_stability = CycleBuffer(maxlen=history_days_fixation)
+        # --- Normalization Ranges ---
+        # Used to scale metrics before applying weights for the ocular score component
+        self.metric_ranges = {
+            'saccade_velocity': saccade_norm_range,
+            'fixation_stability': stability_norm_range,
+            'blink_rate': blink_norm_range
+        }
 
-        # Temporary storage for current day's metrics before averaging
-        self._today_velocity_readings = []
-        self._today_fixation_readings = []
-        self._last_aggregation_timestamp = time.time()
+        # --- Thresholds for Final Classification ---
+        # Based directly on the provided requirements table
+        self.thresholds = {
+            'saccade_velocity_moderate': 400, # Below this is moderate or high risk (ocular)
+            'saccade_velocity_high': 300,     # Below this is high risk (ocular)
+            'genetic_score_moderate': 1.5,    # Above this is moderate or high risk (genetic)
+            'genetic_score_high': 2.5,        # Above this is high risk (genetic)
+        }
 
-    def _normalize_metric(self, value, min_val, max_val, invert=False):
-        """Normalizes a metric value to a 0-1 range."""
-        if max_val == min_val: return 0.5 # Avoid division by zero, return neutral value
-        normalized = (value - min_val) / (max_val - min_val)
-        normalized = np.clip(normalized, 0.0, 1.0) # Ensure value stays within [0, 1]
-        return 1.0 - normalized if invert else normalized
+        logging.info(f"PDDetector initialized. Weights: {self.weights}. Thresholds: {self.thresholds}")
 
-    def _aggregate_daily_metrics(self):
-        """Calculates and stores the average metrics for the completed day."""
-        # This function would typically be called once daily or when loading the app
-        # For simplicity here, we'll call it periodically if a day has passed.
-        current_time = time.time()
-        # Check if roughly a day (86400 seconds) has passed since last aggregation
-        if current_time - self._last_aggregation_timestamp >= 86400:
-            if self._today_velocity_readings:
-                avg_vel = np.mean(self._today_velocity_readings)
-                self.daily_avg_saccade_velocity.append(avg_vel)
-                self._today_velocity_readings = [] # Reset for the new day
+    def _normalize_metric(self, value, metric_key, invert=False):
+        """Normalizes a metric value to a 0-1 range based on predefined ranges."""
+        if value is None:
+            logging.warning(f"Normalization skipped for {metric_key}: Received None value. Returning 0.5 (neutral).")
+            return 0.5 # Neutral value for missing data
 
-            if self._today_fixation_readings:
-                avg_fix = np.mean(self._today_fixation_readings)
-                self.daily_avg_fixation_stability.append(avg_fix)
-                self._today_fixation_readings = [] # Reset for the new day
+        if metric_key not in self.metric_ranges:
+            logging.warning(f"Normalization range not defined for metric: {metric_key}. Returning 0.5.")
+            return 0.5
 
-            self._last_aggregation_timestamp = current_time
-            # In a real app: Save updated buffers to storage here
-            print("Aggregated daily metrics and updated trend buffers.")
+        min_val, max_val = self.metric_ranges[metric_key]
+
+        if max_val == min_val:
+            logging.warning(f"Min and Max range values are equal for {metric_key}. Returning 0.5.")
+            return 0.5 # Avoid division by zero
+
+        try:
+            value_float = float(value)
+            normalized = (value_float - min_val) / (max_val - min_val)
+            normalized = np.clip(normalized, 0.0, 1.0) # Ensure value stays within [0, 1]
+            result = 1.0 - normalized if invert else normalized
+            # logging.debug(f"Normalized {metric_key}: {value} -> {result:.3f} (Invert: {invert})")
+            return result
+        except (ValueError, TypeError) as e:
+            logging.error(f"Error normalizing {metric_key} with value '{value}': {e}. Returning 0.5.")
+            return 0.5
 
 
-    def predict(self, metrics, ethnicity=None):
+    def _calculate_ocular_risk_score(self, ocular_metrics):
         """
-        Calculates the PD risk score based on current metrics and historical trends.
-
-        Args:
-            metrics (dict): A dictionary of eye metrics from EyeTracker.
-                            Expected keys depend on self.weights.
-            ethnicity (str, optional): Patient's ethnicity (passed for potential future use
-                                       or downstream components like BioNeMo).
-
-        Returns:
-            tuple: (risk_level, contributing_factors)
-                   - risk_level (float): A score between 0.0 and 1.0 indicating risk.
-                   - contributing_factors (dict): Metrics and their contribution to the score.
+        Calculates a combined score based *only* on the weighted ocular metrics.
+        This score is primarily for understanding the contribution of eye movements,
+        the final classification uses the threshold table.
         """
-        if not metrics:
-            return 0.0, {} # No metrics, no risk
+        if not ocular_metrics:
+            return 0.0, {}
 
-        # --- Aggregate daily metrics if needed ---
-        # self._aggregate_daily_metrics() # Call this based on time passing
-
-        # --- Store current readings for daily aggregation ---
-        # (Only store if values are reasonable)
-        if 'saccade_velocity' in metrics and metrics['saccade_velocity'] > 0:
-             self._today_velocity_readings.append(metrics['saccade_velocity'])
-        if 'fixation_stability' in metrics and metrics['fixation_stability'] >= 0:
-             self._today_fixation_readings.append(metrics['fixation_stability'])
-
-
-        # --- Calculate Score from Current Metrics ---
-        risk_score = 0.0
+        ocular_score = 0.0
         contributing_factors = {}
 
-        # Define expected ranges for normalization (these need careful calibration)
-        # Example ranges:
-        VELOCITY_RANGE = (50, 400) # degrees/sec (example)
-        STABILITY_RANGE = (0.01, 1.0) # Pixel std dev (example)
-        BLINK_RATE_RANGE = (5, 30) # Blinks per minute (example)
-        V_SACCADE_RATIO_RANGE = (0.1, 1.0) # Ratio (example)
+        # Metric keys expected from EyeTracker
+        vel_key = 'saccade_velocity_deg_s'
+        stab_key = 'fixation_stability_deg' # Expecting stability in degrees now
+        blink_key = 'blink_rate_bpm'
 
-        # 1. Saccade Velocity (Inverse relationship assumed: lower velocity -> higher risk)
-        if 'saccade_velocity' in metrics:
-            norm_vel_inv = self._normalize_metric(metrics['saccade_velocity'], VELOCITY_RANGE[0], VELOCITY_RANGE[1], invert=True)
-            contribution = norm_vel_inv * self.weights['saccade_velocity_inv']
-            risk_score += contribution
-            contributing_factors['Saccade Velocity (Inv)'] = contribution
+        # 1. Saccade Velocity (Inverse relationship: lower velocity -> higher risk contribution)
+        norm_vel_inv = self._normalize_metric(ocular_metrics.get(vel_key), 'saccade_velocity', invert=True)
+        contribution_vel = norm_vel_inv * self.weights['saccade_velocity_inv']
+        ocular_score += contribution_vel
+        contributing_factors['Saccade Velocity (Inv)'] = contribution_vel
 
-        # 2. Fixation Stability (Direct relationship assumed: higher instability -> higher risk)
-        if 'fixation_stability' in metrics:
-            norm_stab = self._normalize_metric(metrics['fixation_stability'], STABILITY_RANGE[0], STABILITY_RANGE[1], invert=False)
-            contribution = norm_stab * self.weights['fixation_stability']
-            risk_score += contribution
-            contributing_factors['Fixation Stability'] = contribution
+        # 2. Fixation Stability (Direct relationship: higher instability -> higher risk contribution)
+        norm_stab = self._normalize_metric(ocular_metrics.get(stab_key), 'fixation_stability', invert=False)
+        contribution_stab = norm_stab * self.weights['fixation_stability']
+        ocular_score += contribution_stab
+        contributing_factors['Fixation Stability'] = contribution_stab
 
-        # 3. Blink Rate Deviation (Deviation from baseline -> higher risk)
-        if 'blink_rate' in metrics:
-            deviation = abs(metrics['blink_rate'] - self.baseline_blink_rate)
-            # Normalize deviation based on how far it *could* deviate within the range
-            max_deviation = max(abs(BLINK_RATE_RANGE[0] - self.baseline_blink_rate), abs(BLINK_RATE_RANGE[1] - self.baseline_blink_rate))
-            norm_blink_dev = self._normalize_metric(deviation, 0, max_deviation, invert=False)
-            contribution = norm_blink_dev * self.weights['blink_rate_deviation']
-            risk_score += contribution
-            contributing_factors['Blink Rate Deviation'] = contribution
+        # 3. Blink Rate Deviation (Deviation from baseline -> higher risk contribution)
+        blink_rate = ocular_metrics.get(blink_key)
+        if blink_rate is not None:
+            deviation = abs(blink_rate - self.baseline_blink_rate)
+            # Normalize the deviation itself relative to max possible deviation from baseline
+            min_rate, max_rate = self.metric_ranges['blink_rate']
+            max_deviation = max(abs(min_rate - self.baseline_blink_rate), abs(max_rate - self.baseline_blink_rate))
+            if max_deviation > 0:
+                 norm_blink_dev = min(deviation / max_deviation, 1.0) # Clip at 1.0
+            else:
+                 norm_blink_dev = 0.0
+            contribution_blink = norm_blink_dev * self.weights['blink_rate_deviation']
+            ocular_score += contribution_blink
+            contributing_factors['Blink Rate Deviation'] = contribution_blink
+        else:
+            contributing_factors['Blink Rate Deviation'] = 0.0 # No contribution if missing
 
-        # 4. Vertical Saccade Ratio (Example: Ratio of vertical to horizontal velocity)
-        if 'vertical_saccade_velocity' in metrics and 'horizontal_saccade_velocity' in metrics and metrics['horizontal_saccade_velocity'] > 0:
-            ratio = metrics['vertical_saccade_velocity'] / metrics['horizontal_saccade_velocity']
-            norm_ratio = self._normalize_metric(ratio, V_SACCADE_RATIO_RANGE[0], V_SACCADE_RATIO_RANGE[1], invert=False) # Assuming higher ratio might be risk? Needs clinical basis.
-            contribution = norm_ratio * self.weights['vertical_saccade_ratio']
-            risk_score += contribution
-            contributing_factors['Vertical Saccade Ratio'] = contribution
+        # Normalize the final ocular score based on the sum of weights
+        max_possible_score = sum(self.weights.values())
+        normalized_ocular_score = np.clip(ocular_score / max_possible_score, 0.0, 1.0) if max_possible_score > 0 else 0.0
 
-
-        # --- Incorporate Longitudinal Trends (Example Logic) ---
-        # Compare current metrics to historical averages.
-        # This logic is basic and needs refinement based on clinical understanding.
-
-        # Velocity Trend: If current velocity is significantly lower than 7-day avg
-        if len(self.daily_avg_saccade_velocity) > 0 and 'saccade_velocity' in metrics:
-            avg_vel_hist = self.daily_avg_saccade_velocity.mean()
-            if metrics['saccade_velocity'] < avg_vel_hist * 0.8: # e.g., 20% lower
-                trend_factor = 0.1 # Add a small risk factor for negative trend
-                risk_score += trend_factor
-                contributing_factors['Velocity Trend (Low)'] = trend_factor
-
-        # Stability Trend: If current stability is significantly higher than 30-day avg
-        if len(self.daily_avg_fixation_stability) > 0 and 'fixation_stability' in metrics:
-             avg_stab_hist = self.daily_avg_fixation_stability.mean()
-             if metrics['fixation_stability'] > avg_stab_hist * 1.2: # e.g., 20% higher
-                 trend_factor = 0.1 # Add a small risk factor for negative trend
-                 risk_score += trend_factor
-                 contributing_factors['Stability Trend (High)'] = trend_factor
-
-
-        # --- Final Risk Score Calculation ---
-        # Normalize the total score based on the maximum possible score from weights
-        max_possible_score = sum(self.weights.values()) # Simplistic max score
-        # Add potential trend factors to max possible if they are additive constants
-        max_possible_score += 0.1 + 0.1 # Add max possible trend contributions
-
-        final_risk = np.clip(risk_score / max_possible_score, 0.0, 1.0) if max_possible_score > 0 else 0.0
-
-        # Sort factors by contribution for clarity
+        # Sort factors by contribution
         sorted_factors = dict(sorted(contributing_factors.items(), key=lambda item: item[1], reverse=True))
 
-        return final_risk, sorted_factors
+        return normalized_ocular_score, sorted_factors
 
-    def load_history(self, velocity_history, fixation_history):
-        """Loads historical data into the buffers."""
-        # In a real app, this would load from a file/database via storage.py
-        print(f"Loading history: {len(velocity_history)} velocity, {len(fixation_history)} fixation points.")
-        for v in velocity_history:
-            self.daily_avg_saccade_velocity.append(v)
-        for f in fixation_history:
-            self.daily_avg_fixation_stability.append(f)
+    def assess_risk(self, ocular_metrics, genetic_risk_score):
+        """
+        Assesses the PD risk level based on ocular metrics and genetic score
+        using the defined threshold table.
 
-    def get_history(self):
-        """Returns the current historical data."""
-        return {
-            'velocity': self.daily_avg_saccade_velocity.get_all(),
-            'fixation': self.daily_avg_fixation_stability.get_all()
-        }
+        Args:
+            ocular_metrics (dict): Dictionary of metrics from EyeTracker.
+                                   Must contain 'saccade_velocity_deg_s'.
+                                   Optionally 'fixation_stability_deg', 'blink_rate_bpm'.
+            genetic_risk_score (float): The risk score multiplier from BioNeMo (e.g., 1.0, 1.5, 2.5).
+
+        Returns:
+            tuple: (risk_level, classification_reason, ocular_score, contributing_factors)
+                   - risk_level (RiskLevel): Enum indicating Low, Moderate, or High risk.
+                   - classification_reason (str): Explanation of why the level was chosen.
+                   - ocular_score (float): The calculated score based on weighted ocular metrics (0-1).
+                   - contributing_factors (dict): Ocular metrics and their contribution score.
+        """
+        if ocular_metrics is None:
+            logging.warning("Assess risk called with no ocular metrics.")
+            # Cannot classify without saccade velocity
+            return RiskLevel.LOW, "Insufficient ocular data", 0.0, {}
+        if genetic_risk_score is None:
+             logging.warning("Assess risk called with no genetic risk score. Treating as baseline (1.0).")
+             genetic_risk_score = 1.0 # Assume baseline if missing? Or return error?
+
+        # Calculate the ocular score component (for contributing factors info)
+        ocular_score, contributing_factors = self._calculate_ocular_risk_score(ocular_metrics)
+
+        # Get the key metric for classification: Saccade Velocity
+        saccade_velocity = ocular_metrics.get('saccade_velocity_deg_s')
+
+        if saccade_velocity is None:
+            logging.warning("Saccade velocity missing from ocular metrics. Cannot classify risk.")
+            return RiskLevel.LOW, "Missing saccade velocity data", ocular_score, contributing_factors
+
+        # --- Apply Threshold Logic ---
+        sacc_thresh_high = self.thresholds['saccade_velocity_high']
+        sacc_thresh_mod = self.thresholds['saccade_velocity_moderate']
+        gen_thresh_high = self.thresholds['genetic_score_high']
+        gen_thresh_mod = self.thresholds['genetic_score_moderate']
+
+        risk_level = RiskLevel.LOW # Default to low
+        reason = ""
+
+        # Check for High Risk conditions first
+        is_high_saccade = saccade_velocity < sacc_thresh_high
+        is_high_genetic = genetic_risk_score > gen_thresh_high
+
+        if is_high_saccade or is_high_genetic:
+            risk_level = RiskLevel.HIGH
+            reasons = []
+            if is_high_saccade: reasons.append(f"Saccade velocity ({saccade_velocity:.1f} deg/s) < {sacc_thresh_high}")
+            if is_high_genetic: reasons.append(f"Genetic score ({genetic_risk_score:.2f}x) > {gen_thresh_high}")
+            reason = "High Risk: " + " and ".join(reasons)
+        else:
+            # Check for Moderate Risk conditions
+            is_moderate_saccade = saccade_velocity < sacc_thresh_mod
+            is_moderate_genetic = genetic_risk_score > gen_thresh_mod
+
+            if is_moderate_saccade or is_moderate_genetic:
+                risk_level = RiskLevel.MODERATE
+                reasons = []
+                if is_moderate_saccade: reasons.append(f"Saccade velocity ({saccade_velocity:.1f} deg/s) < {sacc_thresh_mod}")
+                if is_moderate_genetic: reasons.append(f"Genetic score ({genetic_risk_score:.2f}x) > {gen_thresh_mod}")
+                reason = "Moderate Risk: " + " and ".join(reasons)
+            else:
+                # If neither High nor Moderate conditions met, it's Low Risk
+                risk_level = RiskLevel.LOW
+                reason = f"Low Risk: Saccade velocity ({saccade_velocity:.1f} deg/s) >= {sacc_thresh_mod} and Genetic score ({genetic_risk_score:.2f}x) <= {gen_thresh_mod}"
+
+        logging.info(f"Risk Assessment: Level={risk_level.value}. Reason: {reason}")
+        return risk_level, reason, ocular_score, contributing_factors
 
 
 # Example Usage
 if __name__ == '__main__':
     detector = PDDetector()
 
-    # Simulate loading some history
-    detector.load_history(
-        velocity_history=[200, 210, 195, 205, 190, 185, 198], # Example 7 days velocity
-        fixation_history=[0.3, 0.35, 0.4, 0.33] * 7 + [0.31, 0.36] # Example 30 days fixation
-    )
+    print("\n--- Test Cases ---")
 
-    # Simulate receiving metrics from EyeTracker
-    sample_metrics_low_risk = {
-        'saccade_velocity': 250,
-        'fixation_stability': 0.2,
-        'blink_rate': 16,
-        'vertical_saccade_velocity': 80,
-        'horizontal_saccade_velocity': 240
-    }
+    # Low Risk Scenario
+    metrics_low = {'saccade_velocity_deg_s': 450, 'fixation_stability_deg': 0.5, 'blink_rate_bpm': 20}
+    genetic_low = 1.2
+    level, reason, ocular, factors = detector.assess_risk(metrics_low, genetic_low)
+    print(f"Scenario: Low Ocular, Low Genetic")
+    print(f"  Metrics: {metrics_low}")
+    print(f"  Genetic Score: {genetic_low}")
+    print(f"  Result: Level={level.value}, OcularScore={ocular:.3f}")
+    print(f"  Reason: {reason}")
+    # print(f"  Factors: {factors}")
 
-    sample_metrics_high_risk = {
-        'saccade_velocity': 100, # Low velocity
-        'fixation_stability': 0.8, # High instability
-        'blink_rate': 5, # Low blink rate (large deviation)
-        'vertical_saccade_velocity': 100,
-        'horizontal_saccade_velocity': 110 # High V/H ratio
-    }
+    # Moderate Risk (Low Saccade)
+    metrics_mod_sacc = {'saccade_velocity_deg_s': 350, 'fixation_stability_deg': 0.6, 'blink_rate_bpm': 18}
+    genetic_mod_sacc = 1.3
+    level, reason, ocular, factors = detector.assess_risk(metrics_mod_sacc, genetic_mod_sacc)
+    print(f"\nScenario: Moderate Ocular (Saccade), Low Genetic")
+    print(f"  Metrics: {metrics_mod_sacc}")
+    print(f"  Genetic Score: {genetic_mod_sacc}")
+    print(f"  Result: Level={level.value}, OcularScore={ocular:.3f}")
+    print(f"  Reason: {reason}")
 
-    # Simulate metrics showing a negative trend compared to history
-    sample_metrics_trend = {
-        'saccade_velocity': 150, # Lower than historical avg (~197)
-        'fixation_stability': 0.5, # Higher than historical avg (~0.34)
-        'blink_rate': 15,
-        'vertical_saccade_velocity': 60,
-        'horizontal_saccade_velocity': 140
-    }
+    # Moderate Risk (High Genetic)
+    metrics_mod_gen = {'saccade_velocity_deg_s': 410, 'fixation_stability_deg': 0.7, 'blink_rate_bpm': 22}
+    genetic_mod_gen = 1.8
+    level, reason, ocular, factors = detector.assess_risk(metrics_mod_gen, genetic_mod_gen)
+    print(f"\nScenario: Low Ocular, Moderate Genetic")
+    print(f"  Metrics: {metrics_mod_gen}")
+    print(f"  Genetic Score: {genetic_mod_gen}")
+    print(f"  Result: Level={level.value}, OcularScore={ocular:.3f}")
+    print(f"  Reason: {reason}")
 
+    # High Risk (Very Low Saccade)
+    metrics_high_sacc = {'saccade_velocity_deg_s': 250, 'fixation_stability_deg': 1.0, 'blink_rate_bpm': 15}
+    genetic_high_sacc = 1.4 # Genetic score doesn't need to be high if saccade is very low
+    level, reason, ocular, factors = detector.assess_risk(metrics_high_sacc, genetic_high_sacc)
+    print(f"\nScenario: High Ocular (Saccade), Low Genetic")
+    print(f"  Metrics: {metrics_high_sacc}")
+    print(f"  Genetic Score: {genetic_high_sacc}")
+    print(f"  Result: Level={level.value}, OcularScore={ocular:.3f}")
+    print(f"  Reason: {reason}")
 
-    risk1, factors1 = detector.predict(sample_metrics_low_risk)
-    print(f"\nLow Risk Scenario:")
-    print(f"Calculated Risk: {risk1:.3f}")
-    print("Contributing Factors:")
-    for factor, value in factors1.items():
-        print(f"  - {factor}: {value:.3f}")
+    # High Risk (Very High Genetic)
+    metrics_high_gen = {'saccade_velocity_deg_s': 380, 'fixation_stability_deg': 0.8, 'blink_rate_bpm': 12}
+    genetic_high_gen = 2.8
+    level, reason, ocular, factors = detector.assess_risk(metrics_high_gen, genetic_high_gen)
+    print(f"\nScenario: Moderate Ocular (Saccade), High Genetic")
+    print(f"  Metrics: {metrics_high_gen}")
+    print(f"  Genetic Score: {genetic_high_gen}")
+    print(f"  Result: Level={level.value}, OcularScore={ocular:.3f}")
+    print(f"  Reason: {reason}")
 
-    risk2, factors2 = detector.predict(sample_metrics_high_risk)
-    print(f"\nHigh Risk Scenario:")
-    print(f"Calculated Risk: {risk2:.3f}")
-    print("Contributing Factors:")
-    for factor, value in factors2.items():
-        print(f"  - {factor}: {value:.3f}")
+    # High Risk (Both Moderate/High)
+    metrics_high_both = {'saccade_velocity_deg_s': 320, 'fixation_stability_deg': 1.5, 'blink_rate_bpm': 28}
+    genetic_high_both = 1.9
+    level, reason, ocular, factors = detector.assess_risk(metrics_high_both, genetic_high_both)
+    print(f"\nScenario: Moderate Ocular (Saccade), Moderate Genetic")
+    print(f"  Metrics: {metrics_high_both}")
+    print(f"  Genetic Score: {genetic_high_both}")
+    print(f"  Result: Level={level.value}, OcularScore={ocular:.3f}")
+    print(f"  Reason: {reason}")
 
-    risk3, factors3 = detector.predict(sample_metrics_trend)
-    print(f"\nNegative Trend Scenario:")
-    print(f"Calculated Risk: {risk3:.3f}")
-    print("Contributing Factors:")
-    for factor, value in factors3.items():
-        print(f"  - {factor}: {value:.3f}")
-
-    # print("\nCurrent History Buffers:")
-    # print(f"  Velocity (last {detector.daily_avg_saccade_velocity.buffer.maxlen}): {detector.get_history()['velocity']}")
-    # print(f"  Fixation (last {detector.daily_avg_fixation_stability.buffer.maxlen}): {detector.get_history()['fixation']}")
+    # Missing Saccade Velocity
+    metrics_missing = {'fixation_stability_deg': 0.5, 'blink_rate_bpm': 20}
+    genetic_missing = 1.2
+    level, reason, ocular, factors = detector.assess_risk(metrics_missing, genetic_missing)
+    print(f"\nScenario: Missing Saccade Velocity")
+    print(f"  Metrics: {metrics_missing}")
+    print(f"  Genetic Score: {genetic_missing}")
+    print(f"  Result: Level={level.value}, OcularScore={ocular:.3f}")
+    print(f"  Reason: {reason}")
