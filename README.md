@@ -1,5 +1,6 @@
 # GenomeGuard: Early Parkinson's Detection System
-## Multi-modal diagnostic platform combining eye movement analysis and genomic simulation for pre-symptomatic Parkinson's detection
+## Multi-modal diagnostic platform combining eye movement analysis and genomic simulation for pre-symptomatic Parkinson's detection (revamp in progress)
+
 ## Table of Contents
 Key Innovations
 System Architecture
