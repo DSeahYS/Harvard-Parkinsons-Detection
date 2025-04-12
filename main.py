@@ -127,4 +127,4 @@ if __name__ == '__main__':
              print(f"FATAL ERROR: {e}. Check logs in '{log_dir}'.", file=sys.stderr)
     finally:
         # Final cleanup attempt (though _on_close should handle most)
-        logger.info("Application shutdown sequence complete.")
+        logger.info("Application shutdown sequence complete.") 
