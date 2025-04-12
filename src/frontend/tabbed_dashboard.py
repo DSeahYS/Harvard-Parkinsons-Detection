@@ -9,6 +9,7 @@ import os
 import json
 import logging
 from pathlib import Path
+import datetime
 
 # Configure logging at module level first
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -103,7 +104,7 @@ class Dashboard:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def setup_ui(self):
-        self.root.title("GenomeGuard PD Detection System")
+        self.root.title("WELNEST PD Detection System")
         self.root.geometry(f"{self.MIN_WIDTH}x{self.MIN_HEIGHT}")
         self.root.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
 
@@ -117,7 +118,7 @@ class Dashboard:
         header_frame = ttk.Frame(self.root, padding=5)
         header_frame.pack(fill=tk.X)
         
-        ttk.Label(header_frame, text="GenomeGuard", style='Header.TLabel', 
+        ttk.Label(header_frame, text="WELNEST", style='Header.TLabel', 
                  foreground=self.COLOR_PRIMARY).pack(side=tk.LEFT)
         
         self.user_label = ttk.Label(header_frame, text="User: Clinician")
@@ -137,7 +138,6 @@ class Dashboard:
             'ocular': ttk.Frame(self.notebook),
             'genomic': ttk.Frame(self.notebook),
             'risk': ttk.Frame(self.notebook),
-            'longitudinal': ttk.Frame(self.notebook),
             'clinical': ttk.Frame(self.notebook)
         }
         
@@ -146,8 +146,7 @@ class Dashboard:
         self.notebook.add(self.tab_frames['ocular'], text="2. Ocular & Technical")
         self.notebook.add(self.tab_frames['genomic'], text="3. Genomic Analysis")
         self.notebook.add(self.tab_frames['risk'], text="4. Risk Assessment")
-        self.notebook.add(self.tab_frames['longitudinal'], text="5. Longitudinal")
-        self.notebook.add(self.tab_frames['clinical'], text="6. Clinical & Export")
+        self.notebook.add(self.tab_frames['clinical'], text="5. Clinical & Export")
         
         # --- Session Control Panel (Fixed at bottom) ---
         control_frame = ttk.Frame(self.root)
@@ -175,7 +174,6 @@ class Dashboard:
         self.setup_ocular_tab()  # Now includes technical indicators
         self.setup_genomic_tab()
         self.setup_risk_tab()
-        self.setup_longitudinal_tab()
         self.setup_clinical_tab()  # Now includes export options
 
     def setup_patient_tab(self):
@@ -458,36 +456,7 @@ class Dashboard:
         self.risk_trend_label = ttk.Label(details_frame, text="Stable")
         self.risk_trend_label.grid(row=2, column=1, sticky=tk.W, padx=10, pady=5)
         
-    def setup_longitudinal_tab(self):
-        """Setup Longitudinal Tracking tab"""
-        tab = self.tab_frames['longitudinal']
-        
-        # Session selection dropdown
-        session_frame = ttk.Frame(tab)
-        session_frame.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Label(session_frame, text="Select Patient:").pack(side=tk.LEFT, padx=5)
-        self.longitudinal_patient_var = tk.StringVar()
-        self.longitudinal_patient_dropdown = ttk.Combobox(session_frame, textvariable=self.longitudinal_patient_var, state="readonly", width=30)
-        self.longitudinal_patient_dropdown.pack(side=tk.LEFT, padx=5)
-        ttk.Button(session_frame, text="Load", command=self.load_longitudinal_data).pack(side=tk.LEFT, padx=5)
-        
-        # Trend graph
-        graph_frame = ttk.LabelFrame(tab, text="Trend Over Time")
-        graph_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Graph canvas
-        self.trend_canvas = Canvas(graph_frame, bg='white', height=300)
-        self.trend_canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.trend_canvas.create_text(150, 150, text="Trend Visualization", fill="gray")
-        
-        # Time period selector
-        period_frame = ttk.Frame(graph_frame)
-        period_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(period_frame, text="Time Period:").pack(side=tk.LEFT)
-        self.period_var = tk.StringVar(value="30d")
-        for period in ["7d", "30d", "90d", "1y"]:
-            ttk.Radiobutton(period_frame, text=period, variable=self.period_var,
-                           value=period).pack(side=tk.LEFT, padx=10)
+
         
         # Comparisons
         comp_frame = ttk.Frame(tab)
@@ -499,7 +468,18 @@ class Dashboard:
         self.long_baseline_comp = ttk.Label(baseline_frame, text="-",
                                            font=(self.FONT_FAMILY, self.FONT_SIZES['subheader']))
         self.long_baseline_comp.pack(padx=10, pady=10)
-        
+
+        # Population comparison
+        pop_frame = ttk.LabelFrame(comp_frame, text="Population Comparison")
+        pop_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.long_population_comp = ttk.Label(pop_frame, text="-",
+                                            font=(self.FONT_FAMILY, self.FONT_SIZES['subheader']))
+        self.long_population_comp.pack(padx=10, pady=10)
+
+
+
+
+
     def load_longitudinal_data(self):
         """Loads longitudinal data for the selected patient."""
         selected_patient = self.longitudinal_patient_var.get()
@@ -571,9 +551,16 @@ class Dashboard:
         """Updates the trend visualization with the provided data."""
         self.trend_canvas.delete("all")
         
+        # Generate sample data if no real data available
         if not trend_data or len(trend_data) < 2:
-            self.trend_canvas.create_text(150, 150, text="Insufficient data for trend visualization", fill="gray")
-            return
+            days = list(range(1, 31))  # 30 days
+            base_velocity = 350  # Starting velocity (deg/s)
+            trend_data = [{
+                'date': f"Day {day}",
+                'saccade_velocity': max(200, base_velocity - day*5 + np.random.normal(0, 15))
+            } for day in days]
+            self.trend_canvas.create_text(50, 20, text="Sample Data (for demonstration)",
+                                        fill="gray", anchor=tk.NW)
             
         # Canvas dimensions
         canvas_width = self.trend_canvas.winfo_width() or 300
@@ -641,7 +628,51 @@ class Dashboard:
         self.long_population_comp = ttk.Label(pop_frame, text="-",
                                             font=(self.FONT_FAMILY, self.FONT_SIZES['subheader']))
         self.long_population_comp.pack(padx=10, pady=10)
-        
+
+    def _update_longitudinal_display(self, session_data):
+        """Updates longitudinal tab with real session data"""
+        # Clear previous elements
+        self.trend_canvas.delete("all")
+
+        if not session_data or len(session_data) < 2:
+             self.trend_canvas.create_text(150, 150, text="Insufficient session data for trend", fill="gray")
+             return
+
+        # Convert dates to numerical x-axis (days since first session)
+        try:
+            # Ensure start_time exists and is valid ISO format
+            valid_sessions = [s for s in session_data if s.get('start_time')]
+            if not valid_sessions: raise ValueError("No valid start times found")
+
+            dates = [datetime.datetime.fromisoformat(s['start_time']) for s in valid_sessions]
+            dates.sort() # Ensure chronological order
+            start_date = dates[0]
+            x_values = [(d - start_date).days for d in dates]
+
+            # Prepare metric lists, handling None values
+            saccade_values = [s.get('avg_saccade_velocity') for s in valid_sessions]
+            stability_values = [s.get('avg_fixation_stability') for s in valid_sessions]
+
+            # Filter out pairs where a metric is None
+            valid_saccade_data = [(x, v) for x, v in zip(x_values, saccade_values) if v is not None]
+            valid_stability_data = [(x, v) for x, v in zip(x_values, stability_values) if v is not None]
+
+            # Plot each metric if data exists
+            if valid_saccade_data:
+                x_sacc, y_sacc = zip(*valid_saccade_data)
+                self._plot_metric(list(x_sacc), list(y_sacc),
+                                 "Avg Saccade Velocity (°/s)", '#1f77b4')
+            if valid_stability_data:
+                 x_stab, y_stab = zip(*valid_stability_data)
+                 # Multiply stability for better visualization scale if needed
+                 self._plot_metric(list(x_stab), [v * 100 for v in y_stab],
+                                  "Avg Fixation Stability (x100)", '#2ca02c', y_offset=120)
+
+        except (ValueError, TypeError) as e:
+             logger.error(f"Error processing session data for longitudinal display: {e}", exc_info=True)
+             self.trend_canvas.create_text(150, 150, text="Error processing trend data", fill="red")
+
+
     def setup_clinical_tab(self):
         """Setup Clinical Decision Support tab"""
         tab = self.tab_frames['clinical']
@@ -842,8 +873,8 @@ class Dashboard:
                 self.update_patient_display()
                 self.start_btn.config(state=tk.NORMAL)
                 logger.info(f"Loaded patient ID: {patient_db_id} ({patient_info.get('name', 'N/A')})")
-                # Load patient history for longitudinal view
-                self.load_patient_history()
+                # Load patient history for dropdowns
+                self.load_patient_history() # Populates session dropdowns
             else:
                 messagebox.showerror("Error", f"Patient with ID {patient_db_id} not found.", parent=self.root)
                 self._clear_patient_data()
@@ -870,11 +901,9 @@ class Dashboard:
                 self.genomic_session_dropdown['values'] = []
                 self.genomic_session_var.set("")
                 
-                # Only update these if they exist (they might not be created yet)
+                # Only update baseline comparison if it exists
                 if hasattr(self, 'long_baseline_comp'):
                     self.long_baseline_comp.config(text="No baseline data available")
-                if hasattr(self, 'long_population_comp'):
-                    self.long_population_comp.config(text="No population data available")
                 return
                 
             # Format session list for dropdowns
@@ -894,22 +923,7 @@ class Dashboard:
             self.risk_session_dropdown['values'] = session_list
             self.clinical_session_dropdown['values'] = session_list
             
-            # Update patient dropdown for longitudinal tab
-            patient_list = []
-            patients = self.storage.list_patients()
-            for patient in patients:
-                patient_id = patient.get('id')
-                patient_name = patient.get('name', 'Unknown')
-                patient_list.append(f"ID: {patient_id} - {patient_name}")
-            
-            self.longitudinal_patient_dropdown['values'] = patient_list
-            
-            # Set current patient as default for longitudinal
-            if patient_list:
-                for patient_item in patient_list:
-                    if f"ID: {self.current_patient_id}" in patient_item:
-                        self.longitudinal_patient_var.set(patient_item)
-                        break
+            # Patient list no longer used for longitudinal tab
             
             # Set most recent session as default for other dropdowns
             if session_list:
@@ -917,17 +931,13 @@ class Dashboard:
                 self.risk_session_var.set(session_list[0])
                 self.clinical_session_var.set(session_list[0])
                 
-            # Update longitudinal tab with baseline data
+            # Baseline data comparisons can remain as general info
             if len(sessions) > 1:
                 if hasattr(self, 'long_baseline_comp'):
                     self.long_baseline_comp.config(text=f"First session: {sessions[0].get('start_time', 'Unknown')}")
-                if hasattr(self, 'long_population_comp'):
-                    self.long_population_comp.config(text="Population comparison available")
             else:
                 if hasattr(self, 'long_baseline_comp'):
-                    self.long_baseline_comp.config(text="No baseline data available (only one session)")
-                if hasattr(self, 'long_population_comp'):
-                    self.long_population_comp.config(text="No population data available")
+                    self.long_baseline_comp.config(text="Single session data")
                 
         except Exception as e:
             logger.error(f"Error loading patient history: {e}", exc_info=True)
@@ -1037,7 +1047,8 @@ class Dashboard:
         if not self.video_thread or not self.video_thread.is_running:
              messagebox.showerror("Camera Error", "Failed to start camera stream.", parent=self.root)
              logger.error("Failed to start camera stream.")
-             self.storage.end_session(self.current_session_id, error="Camera failed") # End session with error
+             if self.current_session_id:  # Only end session if it was successfully started
+                 self.storage.end_session(self.current_session_id, error="Camera failed")
              self.session_active = False
              self.current_session_id = None
              return
@@ -1050,21 +1061,34 @@ class Dashboard:
             self.result_queue,
             self.genomic_queue, # Pass queue for triggering genomic analysis
             debug_mode=False # Start in non-debug mode for clinical view
-        ).start()
+        )
+        # Pass the session ID obtained from storage.start_session
+        self.processing_thread.start_session(self.current_session_id)
+        self.processing_thread.start()
+        logger.info("Processing thread started.")
+
+        # Get ethnicity safely
+        ethnicity = self.current_patient_info.get('ethnicity', 'Other') if self.current_patient_info else 'Other'
 
         self.genomic_thread = GenomicAnalysisThread(
             self.bionemo_assessor, # Use the new assessor class
             self.genomic_queue,
-            self.result_queue,
-            self.current_patient_info['ethnicity'] if self.current_patient_info else 'Other'
-        ).start()
+            self.result_queue # Keep for error reporting
+            # Ethnicity is now passed in start_session
+        )
+        # Pass the session ID and ethnicity
+        self.genomic_thread.start_session(self.current_session_id, ethnicity)
+        self.genomic_thread.start()
+        logger.info("Genomic thread started.")
 
         if self.llm_client:
             self.llm_thread = LLMAnalysisThread(
                 self.llm_client,
                 self.llm_queue,
                 self.result_queue
-            ).start()
+            )
+            # LLM thread doesn't need session ID directly, it gets it with the request data
+            self.llm_thread.start()
             logger.info("LLM thread started.")
         else:
              logger.info("LLM client not configured, LLM thread not started.")
@@ -1095,91 +1119,22 @@ class Dashboard:
         # Stop threads gracefully
         self.stop_session_threads()
 
-        # End DB session logging
+        # End DB session logging - simplified call
+        # Calculation of averages and saving details is now handled within storage.end_session
         if self.current_session_id:
             try:
-                # Calculate average risk or other summary stats for the session
-                raw_log_data = self.processing_thread.get_raw_log() if self.processing_thread else []
-                
-                # Create a summary metrics dictionary from the raw log data
-                summary_metrics = {}
-                if raw_log_data:
-                    # Calculate averages from the raw log data
-                    saccade_velocities = [entry.get('eye_metrics', {}).get('saccade_velocity_deg_s', 0) for entry in raw_log_data if entry.get('eye_metrics')]
-                    fixation_stabilities = [entry.get('eye_metrics', {}).get('fixation_stability_deg', 0) for entry in raw_log_data if entry.get('eye_metrics')]
-                    blink_rates = [entry.get('eye_metrics', {}).get('blink_rate_bpm', 0) for entry in raw_log_data if entry.get('eye_metrics')]
-                    
-                    # Calculate risk levels from pd_risk entries
-                    risk_levels = []
-                    for entry in raw_log_data:
-                        if entry.get('pd_risk') and isinstance(entry['pd_risk'], tuple) and len(entry['pd_risk']) > 0:
-                            risk_level = entry['pd_risk'][0]
-                            if hasattr(risk_level, 'value'):  # If it's an enum
-                                risk_level_str = risk_level.value
-                                if risk_level_str == "Low":
-                                    risk_levels.append(0.0)
-                                elif risk_level_str == "Moderate":
-                                    risk_levels.append(0.5)
-                                elif risk_level_str == "High":
-                                    risk_levels.append(1.0)
-                    
-                    # Calculate averages
-                    summary_metrics['avg_saccade_velocity'] = sum(saccade_velocities) / len(saccade_velocities) if saccade_velocities else 0
-                    summary_metrics['avg_fixation_stability'] = sum(fixation_stabilities) / len(fixation_stabilities) if fixation_stabilities else 0
-                    summary_metrics['avg_blink_rate'] = sum(blink_rates) / len(blink_rates) if blink_rates else 0
-                    summary_metrics['avg_risk_level'] = sum(risk_levels) / len(risk_levels) if risk_levels else 0
-                
-                # Save raw log data to a JSON file
-                json_log_filename = None
-                if raw_log_data:
-                    try:
-                        # Create a filename based on session ID and timestamp
-                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        filename = f"session_{self.current_session_id}_{timestamp}.json"
-                        filepath = os.path.join(self.config.get('sessions_dir', './data/sessions'), filename)
-                        
-                        # Ensure directory exists
-                        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-                        
-                        # Convert raw log data to JSON-serializable format
-                        serializable_data = []
-                        for entry in raw_log_data:
-                            serializable_entry = {}
-                            for key, value in entry.items():
-                                if key == 'pd_risk' and isinstance(value, tuple) and len(value) > 0:
-                                    # Handle RiskLevel enum
-                                    if hasattr(value[0], 'value'):
-                                        serializable_entry[key] = [value[0].value] + list(value[1:])
-                                    else:
-                                        serializable_entry[key] = list(value)
-                                elif isinstance(value, dict):
-                                    serializable_entry[key] = value
-                                else:
-                                    serializable_entry[key] = str(value)
-                            serializable_data.append(serializable_entry)
-                        
-                        # Write to file
-                        with open(filepath, 'w') as f:
-                            json.dump(serializable_data, f, indent=2)
-                        
-                        json_log_filename = filename
-                    except Exception as e:
-                        logger.error(f"Error saving raw log data: {e}")
-                
-                # End the session with the calculated summary metrics and JSON log filename
-                session_log_path = self.storage.end_session(
-                    self.current_session_id,
-                    summary_metrics=summary_metrics,
-                    json_log_filename=json_log_filename
-                )
-                logger.info(f"Ended session ID: {self.current_session_id}")
-                if session_log_path:
-                     messagebox.showinfo("Session Saved", f"Session {self.current_session_id} ended.\nLog saved to:\n{session_log_path}", parent=self.root)
+                # Add any final notes if needed (e.g., from a notes widget)
+                notes = None # Placeholder for notes input if UI is added
+                success = self.storage.end_session(self.current_session_id, notes=notes)
+                if success:
+                    logger.info(f"Ended session ID: {self.current_session_id} in DB.")
+                    messagebox.showinfo("Session Ended", f"Session {self.current_session_id} ended and data saved.", parent=self.root)
                 else:
-                     messagebox.showinfo("Session Ended", f"Session {self.current_session_id} ended.", parent=self.root)
+                    logger.warning(f"Failed to update session end info in DB for {self.current_session_id}.")
+                    messagebox.showwarning("Session End Issue", f"Session {self.current_session_id} ended, but DB update failed.", parent=self.root)
             except Exception as e:
-                logger.error(f"Failed to end database session {self.current_session_id}: {e}", exc_info=True)
-                messagebox.showerror("Database Error", f"Failed to properly end session logging: {e}", parent=self.root)
+                logger.error(f"Error during storage.end_session for {self.current_session_id}: {e}", exc_info=True)
+                messagebox.showerror("Database Error", f"Failed to finalize session logging: {e}", parent=self.root)
 
         # Reset state
         self.current_session_id = None
@@ -1236,6 +1191,9 @@ class Dashboard:
 
     def check_queues(self):
         """Periodically check queues for results from threads."""
+        if not self.root.winfo_exists():  # Check if window still exists
+            return
+            
         try:
             while not self.result_queue.empty():
                 result_type, data = self.result_queue.get_nowait()
@@ -1257,12 +1215,6 @@ class Dashboard:
                     self.last_metrics_update = eye_metrics # Store latest full metrics
                     self.last_risk_assessment = pd_risk_info
 
-                elif result_type == "genomic_result":
-                    self.last_genomic_update = data
-                    self.update_genomic_display(data)
-                    # Switch to genomic tab to show results
-                    self.notebook.select(self.tab_frames['genomic'])
-
                 elif result_type == "llm_result":
                     analysis_type, analysis_text = data
                     self.update_cds_display(analysis_text, analysis_type) # Update CDS section
@@ -1272,13 +1224,13 @@ class Dashboard:
                 elif result_type == "status_update":
                     thread_name, status_msg = data
                     logger.info(f"Status from {thread_name}: {status_msg}")
-                    # Update a general status bar if needed
+                    if "Genomic analysis" in status_msg:
+                         self.update_cds_display(status_msg, "System Status")
 
                 elif result_type == "error":
                      thread_name, error_msg = data
                      logger.error(f"Error from {thread_name}: {error_msg}")
                      messagebox.showerror(f"Thread Error ({thread_name})", error_msg, parent=self.root)
-                     # self.stop_session() # Consider stopping on critical errors
 
                 self.result_queue.task_done()
 
@@ -1293,8 +1245,11 @@ class Dashboard:
             elapsed_str = time.strftime('%M:%S', time.gmtime(elapsed))
             self.pat_info_session_dur.config(text=f"{elapsed_str}")
 
-        # Reschedule the check with a shorter interval for smoother video
-        self.root.after(10, self.check_queues) # Check every 10ms for smoother video
+        # Store after ID to allow cancellation
+        after_id = self.root.after(10, self.check_queues)
+        if not hasattr(self.root, '_after_ids'):
+            self.root._after_ids = []
+        self.root._after_ids.append(after_id)
 
     def update_video_display(self, frame):
         """Updates the video label with a new frame."""
@@ -1390,14 +1345,36 @@ class Dashboard:
         except Exception as e:
             logger.error(f"Error loading risk session data: {e}", exc_info=True)
             messagebox.showerror("Error", f"Failed to load session data: {e}", parent=self.root)
-    
-    def update_risk_display(self, risk_assessment_results):
-        """Updates the risk assessment display with new data."""
-        if not risk_assessment_results: return
-        risk_level, reason, ocular_score, factors = risk_assessment_results
+    def update_risk_display(self, risk_data):
+        """Updates the risk assessment display with new data.
+        
+        Args:
+            risk_data: Can be either:
+                - tuple: (risk_level, reason, ocular_score, factors)
+                - dict: {'risk_level': RiskLevel, 'reason': str,
+                         'ocular_score': float, 'factors': dict}
+        """
+        if not risk_data: return
+        
+        # Handle both tuple and dict formats
+        if isinstance(risk_data, tuple):
+            risk_level, reason, ocular_score, factors = risk_data
+            risk_dict = {
+                'risk_level': risk_level,
+                'reason': reason,
+                'ocular_score': ocular_score,
+                'factors': factors
+            }
+        else:
+            risk_dict = risk_data
+            
+        risk_level = risk_dict['risk_level']
+        reason = risk_dict['reason']
+        ocular_score = risk_dict['ocular_score']
+        factors = risk_dict.get('factors', {})
 
         # Update Risk Meter
-        draw_risk_meter(self.risk_meter_canvas, ocular_score) # Use ocular score for the meter
+        draw_risk_meter(self.risk_meter_canvas, ocular_score)
 
         # Update Classification and Reason Labels
         level_str = risk_level.value if isinstance(risk_level, RiskLevel) else str(risk_level)
@@ -1406,7 +1383,7 @@ class Dashboard:
         # Set color based on risk level
         if level_str == "HIGH":
             self.risk_classification_label.config(foreground=self.COLOR_DANGER)
-        elif level_str == "MEDIUM":
+        elif level_str == "MODERATE":
             self.risk_classification_label.config(foreground=self.COLOR_ALERT)
         else:
             self.risk_classification_label.config(foreground=self.COLOR_SAFE)
@@ -1417,12 +1394,21 @@ class Dashboard:
         self.risk_factors_text.insert('1.0', reason)
         self.risk_factors_text.config(state=tk.DISABLED)
         
-        # Update confidence
-        confidence = factors.get('confidence', 85)
+        # Update confidence (default to 85% if not specified)
+        confidence = 85
+        if 'confidence' in risk_dict:
+            confidence = risk_dict['confidence']
+        elif 'confidence' in factors:
+            confidence = factors['confidence']
         self.risk_confidence_label.config(text=f"{confidence}%")
         
-        # Update trend
-        trend = factors.get('trend', 'Stable')
+        # Update trend (default to 'Stable' if not specified)
+        trend = 'Stable'
+        if 'trend' in risk_dict:
+            trend = risk_dict['trend']
+        elif 'trend' in factors:
+            trend = factors['trend']
+        self.risk_trend_label.config(text=trend)
         self.risk_trend_label.config(text=trend)
 
     def _update_fixation_heatmap(self, metrics):
@@ -1728,7 +1714,10 @@ class Dashboard:
             self.video_label.config(image=None) # Clear video feed
 
     def generate_report(self):
-        """Generates a clinical report based on the current data."""
+        """
+        Generates a clinical report by loading data from the selected session's
+        JSON files and sending it to the LLM.
+        """
         if not self.llm_client:
             messagebox.showwarning("LLM Not Configured", "OpenRouter API key not found. Cannot generate report.", parent=self.root)
             return
@@ -1736,25 +1725,139 @@ class Dashboard:
              messagebox.showwarning("No Patient", "Load a patient before generating a report.", parent=self.root)
              return
 
-        # Load data from the last completed session for this patient
-        if not self.last_metrics_update and not self.last_genomic_update:
-             messagebox.showwarning("No Data", "No session data available to generate a report.", parent=self.root)
+        # Get the currently selected session ID from the clinical tab dropdown
+        selected_session_str = self.clinical_session_var.get()
+        if not selected_session_str:
+             messagebox.showwarning("No Session Selected", "Select a session from the dropdown in the Clinical tab.", parent=self.root)
+             return
+        try:
+            # Extract session ID (assuming format "Session ID: X - ...")
+            session_id = selected_session_str.split(':')[1].split('-')[0].strip()
+        except Exception:
+             messagebox.showerror("Error", "Invalid session format selected.", parent=self.root)
              return
 
-        logger.info("Triggering LLM for Clinical Report Generation...")
-        # Combine available data
-        report_data = {
-            "patient_info": self.current_patient_info,
-            "ocular_metrics": self.last_metrics_update,
-            "risk_assessment": self.last_risk_assessment,
-            "genomic_analysis": self.last_genomic_update,
-        }
-        # Put data onto the LLM queue with a specific type
-        self.llm_queue.put(("generate_report", report_data))
-        self.update_cds_display("Generating clinical report...", "Status")
+        logger.info(f"Triggering LLM for Clinical Report Generation for session: {session_id}")
+
+        # --- Load Data via StorageManager ---
+        try:
+            session_data = self.storage.get_session_data(session_id)
+            if not session_data:
+                messagebox.showwarning("No Data", f"No data found for session {session_id}", parent=self.root)
+                return
+
+            # Get patient info (already loaded)
+            patient_info = self.current_patient_info
+
+            # Extract metrics and genomic data from session_data
+            metrics_data = session_data.get('metrics', [])
+            genomic_data = session_data.get('genomic', {})
+
+            # --- Prepare Payload for LLM ---
+            # Adapt this payload structure based on what the LLM prompt expects
+            # For example, it might need summary stats calculated from metrics_data
+            report_data = {
+                "session_id": session_id,
+                "patient_info": patient_info,
+                "metrics_log": metrics_data, # Pass the raw log
+                "genomic_analysis": genomic_data,
+                # Add summary stats if needed by the prompt
+                # "summary_stats": self._calculate_summary_stats(metrics_data)
+            }
+
+            # Put data onto the LLM queue
+            # Use a prompt type suitable for analyzing a full session log
+            self.llm_queue.put(("summarize_session_log", report_data))
+            self.update_cds_display(f"Generating clinical report for session {session_id}...", "Status")
+
+            # Switch to clinical tab to show the report generation progress
+            self.notebook.select(self.tab_frames['clinical'])
+
+        except Exception as e:
+            logger.error(f"Error loading data or triggering report for session {session_id}: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Failed to load data for report generation: {e}", parent=self.root)
+
+    def _plot_metric(self, x_values, y_values, label, color, y_offset=0):
+        """Handle invalid data points and canvas dimensions"""
+        # Validate canvas dimensions
+        canvas_width = self.trend_canvas.winfo_width()
+        canvas_height = self.trend_canvas.winfo_height()
+        if canvas_width <= 50 or canvas_height <= 50:
+            logger.warning(f"Postponing plot for {label}: Invalid dimensions {canvas_width}x{canvas_height}")
+            self.root.after(100, lambda: self._plot_metric(x_values, y_values, label, color, y_offset))
+            return
+
+        # Filter valid data points
+        valid_points = []
+        for x, y in zip(x_values, y_values):
+            if x is not None and y is not None and isinstance(y, (int, float)):
+                valid_points.append((x, y))
         
-        # Switch to clinical tab to show the report generation progress
-        self.notebook.select(self.tab_frames['clinical'])
+        if not valid_points:
+            logger.warning(f"No valid points to plot for {label}")
+            return
+            
+        # Extract filtered values
+        x_vals, y_vals = zip(*valid_points)
+
+
+        # Margins and plot area
+        margin_x = 40
+        margin_y = 30 # Top and bottom margin
+        plot_width = canvas_width - 2 * margin_x
+        plot_height = canvas_height - 2 * margin_y
+
+        # Find min/max for scaling
+        min_val = min(values)
+        max_val = max(values)
+        if max_val == min_val: # Avoid division by zero
+            max_val += 1 # Add a small offset if all values are the same
+
+        # Calculate scales safely
+        min_day = min(days)
+        max_day = max(days)
+        day_range = max_day - min_day
+        value_range = max_val - min_val
+
+        # Avoid division by zero if range is 0
+        x_scale = plot_width / day_range if day_range > 0 else plot_width
+        y_scale = plot_height / value_range if value_range > 0 else plot_height
+
+        # Plot points and connect with lines
+        points = []
+        for i, (d, v) in enumerate(zip(days, values)):
+            # Scale to canvas coordinates
+            x = margin_x + (d - min_day) * x_scale
+            # Y is inverted: 0 is top, canvas_height is bottom
+            y = canvas_height - margin_y - (v - min_val) * y_scale
+
+            points.append((x, y))
+            # Draw point slightly offset by y_offset for clarity if multiple lines
+            self.trend_canvas.create_oval(x-3, y-3 + y_offset, x+3, y+3 + y_offset, fill=color, outline="")
+
+        # Connect points with lines
+        if len(points) > 1:
+            for i in range(len(points) - 1):
+                x1, y1 = points[i]
+                x2, y2 = points[i + 1]
+                # Draw line slightly offset by y_offset
+                self.trend_canvas.create_line(x1, y1 + y_offset, x2, y2 + y_offset, fill=color, width=2)
+
+        # Add legend entry (adjust position based on y_offset)
+        legend_y = 20 + (y_offset / 2) # Position legend between lines if offset
+        self.trend_canvas.create_rectangle(margin_x, legend_y - 5, margin_x + 10, legend_y + 5, fill=color, outline="")
+        self.trend_canvas.create_text(margin_x + 15, legend_y, text=label, fill=color, anchor=tk.W)
+
+        # Draw axes (only once, perhaps check if they exist?)
+        # Check if axes already exist using tags
+        if not self.trend_canvas.find_withtag("x-axis"):
+            self.trend_canvas.create_line(margin_x, canvas_height - margin_y, canvas_width - margin_x, canvas_height - margin_y, fill="black", tags="x-axis") # X-axis
+            self.trend_canvas.create_text(canvas_width // 2, canvas_height - 10, text="Days Since First Session", fill="black", tags="x-axis-label")
+        if not self.trend_canvas.find_withtag("y-axis"):
+            self.trend_canvas.create_line(margin_x, margin_y, margin_x, canvas_height - margin_y, fill="black", tags="y-axis") # Y-axis
+            # Add Y-axis label (might need adjustment if multiple metrics plotted)
+            # self.trend_canvas.create_text(15, canvas_height // 2, text="Metric Value", fill="black", angle=90, tags="y-axis-label")
+
 
     def calibrate_camera(self):
         """Calibrates the eye tracking camera."""
@@ -1873,13 +1976,26 @@ class Dashboard:
     def toggle_mesh_view(self):
         """Toggles between normal webcam view and mesh overlay view."""
         self.show_mesh = not self.show_mesh
+        
+        # Update processing thread's mesh setting if it exists
         if self.processing_thread:
             self.processing_thread.toggle_mesh(self.show_mesh)
-        self.webcam_toggle.config(text="Toggle Normal View" if self.show_mesh else "Toggle Mesh View")
+            logger.info(f"Mesh view {'enabled' if self.show_mesh else 'disabled'}")
+        
+        # Update button text
+        self.webcam_toggle.config(
+            text="Show Normal View" if not self.show_mesh else "Show Mesh View"
+        )
 
     def _on_close(self):
         """Handles window closing event."""
         logger.info("Close button clicked.")
+        
+        # Cancel any pending 'after' callbacks
+        if hasattr(self.root, '_after_ids'):
+            for after_id in self.root._after_ids:
+                self.root.after_cancel(after_id)
+        
         if self.session_active:
             if messagebox.askyesno("Session Active", "A session is currently running. Stop session and exit?", parent=self.root):
                 self.stop_session()
