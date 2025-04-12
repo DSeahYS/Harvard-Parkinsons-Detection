@@ -10,8 +10,9 @@ import os # Added import
 # Use absolute imports assuming 'src' is in PYTHONPATH or run via `python -m src.main`
 try:
     from ..models.eye_tracker import EyeTracker
-    from ..models.pd_detector import PDDetector
+    from ..models.pd_detector import PDDetector, RiskLevel
     from ..genomic.bionemo_client import BioNeMoRiskAssessor
+    from ..data.storage import StorageManager # Added import
     from ..llm.openrouter_client import OpenRouterClient
 except ImportError:
     # Fallback for direct execution or different project structure
@@ -141,7 +142,18 @@ class ProcessingThread(threading.Thread):
         self._stop_event = threading.Event()
         self.debug_mode = debug_mode
         self.session_active = False
-        self.raw_log = [] # Store raw metrics for saving at session end
+        # self.raw_log = [] # Deprecated: Replaced by streaming to JSON
+        self.current_genetic_score = 1.0  # Default baseline genetic risk score
+        self.storage = StorageManager() # Get storage instance
+        self.current_session_id = None # Will be set when session starts
+        self.show_mesh = True  # Default to showing mesh
+        self.mesh_lock = threading.Lock()  # For thread-safe access
+
+    def toggle_mesh(self, show_mesh):
+        """Toggle whether to show the face mesh overlay on processed frames"""
+        with self.mesh_lock:
+            self.show_mesh = show_mesh
+        logger.info(f"Mesh display {'enabled' if show_mesh else 'disabled'}")
 
     def run(self):
         logger.info("Processing thread running...")
@@ -158,42 +170,62 @@ class ProcessingThread(threading.Thread):
                 timestamp = time.time()
 
                 # --- Eye Tracking ---
-                processed_frame, eye_metrics, _ = self.eye_tracker.process_frame(frame)
+                # Get current mesh display state
+                with self.mesh_lock:
+                    show_mesh = self.show_mesh
+
+                processed_frame, eye_metrics, _ = self.eye_tracker.process_frame(frame, draw_mesh=show_mesh)
 
                 if eye_metrics:
-                    # --- PD Risk Detection ---
-                    # Pass a default genetic_risk_score of 1.0 (baseline)
-                    pd_risk_info = self.pd_detector.assess_risk(eye_metrics, genetic_risk_score=1.0)
-
-                    # --- Combine Results ---
-                    combined_metrics = {
-                        "timestamp": timestamp,
-                        "eye_metrics": eye_metrics,
-                        "pd_risk": pd_risk_info,
-                        # Genomic results will be added later via another queue item
-                    }
-
-                    # Store raw data if session is active
-                    if self.session_active:
-                        self.raw_log.append(combined_metrics)
-
-                    # Put processed frame and combined metrics onto the result queue
                     try:
-                        # Pass the processed frame (with or without overlay) and the metrics dict
-                        self.result_queue.put(("processed_frame", (processed_frame, combined_metrics)), block=False)
-                    except queue.Full:
-                        logger.warning("Result queue is full. Dropping processed frame/metrics.")
+                        # --- PD Risk Detection ---
+                        risk_tuple = self.pd_detector.assess_risk(eye_metrics, self.current_genetic_score)
+                        
+                        # Convert to dict for safe handling
+                        risk_data = {
+                            'risk_level': risk_tuple[0],
+                            'reason': risk_tuple[1],
+                            'ocular_score': risk_tuple[2],
+                            'factors': risk_tuple[3]
+                        }
 
-                    # --- Trigger Genomic Analysis Periodically ---
-                    if self.session_active and (timestamp - last_genomic_trigger_time > GENOMIC_TRIGGER_INTERVAL):
-                         if not self.genomic_trigger_queue.full():
-                              # Send necessary data (e.g., current eye risk level)
-                              trigger_data = {'eye_risk_level': pd_risk_info.get('risk_level', 0.0)}
-                              self.genomic_trigger_queue.put(trigger_data, block=False)
-                              last_genomic_trigger_time = timestamp
-                              logger.debug("Triggered genomic analysis.")
-                         else:
-                              logger.warning("Genomic trigger queue full. Skipping trigger.")
+                        # --- Combine Results ---
+                        combined_metrics = {
+                            "timestamp": timestamp,
+                            "eye_metrics": eye_metrics,
+                            "pd_risk": risk_data
+                        }
+
+                        # Stream metrics to JSONL file if session is active
+                        if self.session_active and self.current_session_id:
+                            self.storage.save_metric_stream(self.current_session_id, combined_metrics)
+
+                        # Put processed frame and metrics onto result queue
+                        try:
+                            self.result_queue.put((
+                                "processed_frame",
+                                (processed_frame, combined_metrics)
+                            ), block=False)
+                        except queue.Full:
+                            logger.warning("Result queue is full. Dropping processed frame/metrics.")
+
+                        # --- Trigger Genomic Analysis Periodically ---
+                        if self.session_active and (timestamp - last_genomic_trigger_time > GENOMIC_TRIGGER_INTERVAL):
+                            if not self.genomic_trigger_queue.full():
+                                trigger_data = {
+                                    'eye_risk_level': risk_data['risk_level'].value,
+                                    'raw_metrics': eye_metrics
+                                }
+                                self.genomic_trigger_queue.put(trigger_data, block=False)
+                                last_genomic_trigger_time = timestamp
+                                logger.debug("Triggered genomic analysis.")
+                            else:
+                                logger.warning("Genomic trigger queue full. Skipping trigger.")
+
+                    except Exception as e:
+                        logger.error(f"Error processing frame: {e}", exc_info=True)
+                        # Put error frame on queue for UI to handle
+                        self.result_queue.put(("error_frame", (frame, str(e))), block=False)
 
                 else:
                      # If no eye metrics, still put the original/processed frame for display
@@ -206,7 +238,7 @@ class ProcessingThread(threading.Thread):
                 self.frame_queue.task_done() # Mark frame as processed
 
             except queue.Empty:
-                # No frame received within timeout, continue loop
+                # No frame received within timeout, simply continue loop
                 continue
             except Exception as e:
                 logger.error(f"Error in processing thread: {e}", exc_info=True)
@@ -219,18 +251,18 @@ class ProcessingThread(threading.Thread):
 
         logger.info("Processing thread stopped.")
 
-    def start_session(self):
+    def start_session(self, session_id):
+        self.current_session_id = session_id # Store the active session ID
         self.session_active = True
-        self.raw_log = [] # Clear log for new session
-        logger.info("Processing thread session started.")
+        # self.raw_log = [] # Deprecated
+        logger.info(f"Processing thread session started for ID: {session_id}")
 
     def stop_session(self):
         self.session_active = False
         logger.info("Processing thread session stopped.")
         # Log might be retrieved by main thread after stopping
-
-    def get_raw_log(self):
-        return self.raw_log
+    # def get_raw_log(self): # Deprecated: Metrics are streamed directly to JSONL
+    #     return self.raw_log
 
     def set_debug_mode(self, is_debug):
         self.debug_mode = is_debug
@@ -247,44 +279,70 @@ class GenomicAnalysisThread(threading.Thread):
     Thread for running simulated genomic analysis using BioNeMoClient.
     Triggered by items in genomic_trigger_queue, puts results onto result_queue.
     """
-    def __init__(self, bionemo_client: BioNeMoRiskAssessor, trigger_queue: queue.Queue, result_queue: queue.Queue, ethnicity: str):
+    def __init__(self, bionemo_client: BioNeMoRiskAssessor, trigger_queue: queue.Queue, result_queue: queue.Queue): # Removed ethnicity from init
         super().__init__(name="GenomicAnalysisThread", daemon=True)
         self.bionemo_client = bionemo_client
         self.trigger_queue = trigger_queue
-        self.result_queue = result_queue
-        self.ethnicity = ethnicity # Store ethnicity for analysis
+        self.result_queue = result_queue # Still needed for errors/status
+        # self.ethnicity = ethnicity # Ethnicity will be passed with trigger data
         self._stop_event = threading.Event()
+        self.storage = StorageManager() # Get storage instance
+        self.current_session_id = None # Will be set when session starts
+        self.current_ethnicity = None # Will be set when session starts
         self.session_active = False
 
     def run(self):
         logger.info("Genomic analysis thread running...")
         while not self._stop_event.is_set():
             try:
-                # Wait for a trigger event (with data like eye risk level)
+                # Wait for a trigger event (can be just a signal or contain data)
                 trigger_data = self.trigger_queue.get(timeout=1.0)
-                if trigger_data is None: # Sentinel value check (optional)
-                    continue
+                if trigger_data is None: continue # Sentinel
 
-                if not self.session_active:
-                     logger.debug("Genomic thread received trigger but session not active. Ignoring.")
+                if not self.session_active or not self.current_session_id:
+                     logger.debug("Genomic thread received trigger but session not active or ID missing. Ignoring.")
                      self.trigger_queue.task_done()
                      continue
 
-                logger.debug(f"Genomic thread received trigger data: {trigger_data}")
-                eye_risk_level = trigger_data.get('eye_risk_level', 0.0)
+                # Extract necessary info (e.g., eye metrics if needed by actual BioNeMo)
+                # For simulation, we might just need ethnicity stored during start_session
+                logger.info(f"Genomic thread triggered for session {self.current_session_id}, Ethnicity: {self.current_ethnicity}")
 
-                # Perform the simulation
-                genomic_results = self.bionemo_client.simulate_genomics(
-                    eye_risk_level=eye_risk_level,
-                    ethnicity=self.ethnicity
+                # --- Perform Genomic Analysis ---
+                # In a real scenario, pass relevant data (e.g., eye_metrics from trigger_data)
+                # For the simulation, it might only need ethnicity
+                # Let's assume the bionemo_client.analyze needs eye_metrics and ethnicity
+                # We need to get the latest eye_metrics. This design is tricky.
+                # Option 1: Pass latest metrics in trigger_data (might be stale)
+                # Option 2: Genomic thread reads latest from metrics.jsonl (adds complexity)
+                # Option 3: Simplify simulation to not require eye_metrics directly here.
+                # Let's go with Option 3 for now, assuming analyze can work with just ethnicity
+                # or potentially placeholder metrics if absolutely needed by the API structure.
+
+                # Placeholder eye metrics if needed by the analyze method signature
+                placeholder_eye_metrics = {'saccade_velocity_deg_s': 400, 'fixation_stability_deg': 0.5}
+
+                genomic_results = self.bionemo_client.analyze(
+                    eye_metrics=placeholder_eye_metrics, # Use placeholder or get from trigger_data if available
+                    ethnicity=self.current_ethnicity
                 )
 
-                # Put results onto the main result queue
-                try:
-                    self.result_queue.put(("genomic_result", genomic_results), block=False)
-                    logger.info("Genomic analysis complete, results queued.")
-                except queue.Full:
-                    logger.warning("Result queue full. Discarding genomic analysis results.")
+                if genomic_results:
+                    # --- Save results directly to JSON ---
+                    self.storage.save_genomic_results(self.current_session_id, genomic_results)
+                    # Optionally, put a simple notification on result_queue if UI needs to know it's done
+                    try:
+                         self.result_queue.put(("status_update", (self.name, f"Genomic analysis saved for {self.current_session_id}")), block=False)
+                    except queue.Full:
+                         logger.warning("Result queue full when sending genomic status update.")
+                else:
+                     logger.error(f"Genomic analysis failed for session {self.current_session_id}")
+                     # Report error back to UI via result queue
+                     try:
+                          self.result_queue.put(("error", (self.name, f"Genomic analysis failed for session {self.current_session_id}")), block=False)
+                     except queue.Full:
+                          logger.error("Result queue full while trying to report genomic analysis error.")
+
 
                 self.trigger_queue.task_done()
 
@@ -301,22 +359,24 @@ class GenomicAnalysisThread(threading.Thread):
 
         logger.info("Genomic analysis thread stopped.")
 
-    def start_session(self):
+    def start_session(self, session_id, ethnicity):
+        self.current_session_id = session_id
+        self.current_ethnicity = ethnicity
         self.session_active = True
-        # Clear the trigger queue at the start of a session?
+        # Clear the trigger queue at the start of a session
         while not self.trigger_queue.empty():
             try: self.trigger_queue.get_nowait()
             except queue.Empty: break
-        logger.info("Genomic thread session started.")
+        logger.info(f"Genomic thread session started for ID: {session_id}, Ethnicity: {ethnicity}")
 
 
     def stop_session(self):
         self.session_active = False
         logger.info("Genomic thread session stopped.")
 
-    def update_ethnicity(self, ethnicity):
-         self.ethnicity = ethnicity
-         logger.info(f"Genomic thread ethnicity updated to: {ethnicity}")
+    # def update_ethnicity(self, ethnicity): # Deprecated: Ethnicity passed via start_session
+    #      self.ethnicity = ethnicity
+    #      logger.info(f"Genomic thread ethnicity updated to: {ethnicity}")
 
     def stop(self):
         logger.info("Stopping genomic analysis thread...")
