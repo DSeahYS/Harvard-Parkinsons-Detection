@@ -6,6 +6,7 @@ import datetime
 import os
 import logging
 from pathlib import Path # Use pathlib for better path handling
+import uuid
 
 # Configure logging (can be overridden by main app)
 log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
@@ -81,6 +82,10 @@ class StorageManager:
 
              self.db_path = config.get_db_path()
              self.sessions_dir = config.get_sessions_dir()
+
+             # Verify directory permissions
+             logger.info(f"Absolute sessions directory: {self.sessions_dir.absolute()}")
+             logger.info(f"Directory writable: {os.access(self.sessions_dir, os.W_OK)}")
 
              # Ensure directories exist
              self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -158,20 +163,21 @@ class StorageManager:
             # Sessions Table (Summary Data)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT PRIMARY KEY, -- Use UUID as TEXT primary key
                     patient_id INTEGER,
                     start_time TIMESTAMP NOT NULL,
-                    end_time TIMESTAMP,
-                    duration_seconds REAL, -- Calculated duration
-                    avg_risk_level REAL,
-                    avg_saccade_velocity REAL,
-                    avg_fixation_stability REAL,
-                    avg_blink_rate REAL,
-                    genetic_risk_score REAL, -- Store result from BioNeMo if available
-                    json_log_filename TEXT UNIQUE, -- Link to detailed JSON log, ensure uniqueness
+                    end_time TIMESTAMP, -- Store end time when session finishes
+                    duration_seconds REAL, -- Calculated duration at the end
+                    session_dir_path TEXT NOT NULL, -- Path to the directory holding JSON files
+                    -- Store final calculated averages for quick lookup/display if needed
+                    final_avg_risk_level REAL,
+                    final_avg_saccade_velocity REAL,
+                    final_avg_fixation_stability REAL,
+                    final_avg_blink_rate REAL,
+                    final_genetic_risk_score REAL,
                     notes TEXT, -- Optional notes for the session
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (patient_id) REFERENCES patients (id) ON DELETE CASCADE -- Cascade delete sessions if patient is deleted
+                    FOREIGN KEY (patient_id) REFERENCES patients (id) ON DELETE CASCADE
                 )
             ''')
             # Add index for faster patient session lookups
@@ -314,79 +320,231 @@ class StorageManager:
 
     # --- Session Management ---
     def start_session(self, patient_id=None):
-        """Starts a new session and returns its ID."""
-        start_time = datetime.datetime.now().isoformat()
-        sql = '''INSERT INTO sessions(patient_id, start_time) VALUES(?, ?)'''
+        """
+        Starts a new session:
+        1. Generates a UUID for the session ID.
+        2. Creates a dedicated directory for the session's JSON files.
+        3. Inserts a basic record into the SQLite 'sessions' table.
+        Returns the session ID (UUID string).
+        """
+        session_id = str(uuid.uuid4())
+        start_time = datetime.datetime.now()
+        start_time_iso = start_time.isoformat()
+
+        # Create session directory using the configured base path
+        try:
+            session_dir = self.sessions_dir / session_id
+            session_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Created session directory: {session_dir}")
+        except OSError as e:
+            logger.error(f"Failed to create session directory '{session_dir}': {e}", exc_info=True)
+            return None # Cannot proceed without session directory
+
+        # Insert lightweight record into SQLite
+        sql = '''INSERT INTO sessions(id, patient_id, start_time, session_dir_path)
+                 VALUES(?, ?, ?, ?)'''
         conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute(sql, (patient_id, start_time))
+            cursor.execute(sql, (session_id, patient_id, start_time_iso, str(session_dir)))
             conn.commit()
-            session_id = cursor.lastrowid
-            logger.info(f"Started session ID: {session_id} for patient ID: {patient_id}")
-            return session_id
+            logger.info(f"Started session ID: {session_id} for patient ID: {patient_id} in DB.")
+            return session_id # Return the UUID string
         except sqlite3.Error as e:
-            logger.error(f"Error starting session for patient {patient_id}: {e}", exc_info=True)
+            logger.error(f"Error starting session {session_id} in DB for patient {patient_id}: {e}", exc_info=True)
             if conn: conn.rollback()
             return None
 
-    def save_session_details(self, session_id, detailed_data):
-        """Saves detailed session data (e.g., metrics over time) to a JSON file."""
-        # Ensure sessions directory exists (might be called before __init__ fully completes in some scenarios)
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        filename = f"session_{session_id}_{datetime.datetime.now():%Y%m%d_%H%M%S}.json"
-        filepath = self.sessions_dir / filename
+    def save_metric_stream(self, session_id, metrics):
+        """Appends a single metric dictionary to the session's metrics.jsonl file."""
+        if not session_id:
+            logger.error("Cannot save metric stream: session_id is None.")
+            return
+
         try:
-            with open(filepath, 'w') as f:
-                json.dump(detailed_data, f, cls=NumpyEncoder, indent=2) # Use indent=2 for smaller files
-            logger.info(f"Saved detailed session log to '{filepath}'")
-            return filename # Return filename to link in DB
-        except IOError as e:
-            logger.error(f"Error saving session details to JSON '{filepath}': {e}", exc_info=True)
-            return None
-        except TypeError as e:
-             logger.error(f"Error serializing session details to JSON: {e}", exc_info=True)
-             return None
+            session_dir = self.sessions_dir / session_id
+            if not session_dir.exists():
+                logger.error(f"Session directory {session_dir} does not exist!")
+                return
+
+            # Use temp file for atomic writes
+            temp_file = session_dir / 'metrics.tmp'
+            final_file = session_dir / 'metrics.jsonl'
+
+            # Use lock for thread safety
+            with threading.Lock():
+                # Write to temp file first
+                with open(temp_file, 'a', encoding='utf-8') as f:
+                    json.dump({
+                        'timestamp': datetime.datetime.now().isoformat(),
+                        **metrics
+                    }, f, cls=NumpyEncoder)
+                    f.write('\n')
+                    f.flush()  # Ensure data is written
+                    os.fsync(f.fileno())  # Force OS-level flush
+
+                # Rename temp file to final file (atomic on Unix)
+                temp_file.rename(final_file)
+
+        except Exception as e:
+            logger.error(f"Critical error saving metric stream: {e}", exc_info=True)
+            # Clean up temp file if it exists
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
 
 
-    def end_session(self, session_id, summary_metrics=None, json_log_filename=None, notes=None):
-        """Ends a session, updating summary data in the database."""
+    def save_genomic_results(self, session_id, results):
+        """Saves the genomic analysis results to genomic.json for the session."""
+        if not session_id:
+            logger.error("Cannot save genomic results: session_id is None.")
+            return
+
+        try:
+            session_dir = self.sessions_dir / session_id
+            session_dir.mkdir(parents=True, exist_ok=True) # Ensure directory exists
+            genomic_file = session_dir / 'genomic.json'
+
+            with open(genomic_file, 'w', encoding='utf-8') as f:
+                json.dump(results, f, cls=NumpyEncoder, indent=2)
+            logger.info(f"Saved genomic results for session {session_id} to {genomic_file}")
+
+        except Exception as e:
+            logger.error(f"Error saving genomic results for session {session_id}: {e}", exc_info=True)
+
+
+    # Note: save_session_details is now deprecated/removed in favor of streaming.
+
+
+    def end_session(self, session_id, notes=None, error=None):
+        """
+        Ends a session:
+        1. Gets session directory from database
+        2. Reads metrics.jsonl to calculate final average metrics
+        3. Reads genomic.json to get the final genetic score
+        4. Updates the SQLite session record
+
+        Args:
+            session_id: The session ID to end
+            notes: Optional notes about the session
+            error: Optional error message if session ended abnormally
+        """
+        if not session_id:
+            logger.error("Cannot end session: session_id is None.")
+            return False
+
+        # Get session directory from DB
+        session_info = self.get_session_summary(session_id)
+        if not session_info:
+            logger.error(f"Session {session_id} not found in database")
+            return False
+            
+        try:
+            session_dir = Path(session_info['session_dir_path'])
+        except Exception as e:
+            logger.error(f"Invalid session directory path: {e}")
+            return False
+
         end_time_dt = datetime.datetime.now()
         end_time_iso = end_time_dt.isoformat()
 
         # Calculate duration
-        session_summary = self.get_session_summary(session_id)
         duration_seconds = None
-        if session_summary and session_summary.get('start_time'):
-            try:
-                start_time_dt = datetime.datetime.fromisoformat(session_summary['start_time'])
+        try:
+            if session_info.get('start_time'):
+                start_time_dt = datetime.datetime.fromisoformat(session_info['start_time'])
                 duration_seconds = (end_time_dt - start_time_dt).total_seconds()
-            except (ValueError, TypeError):
-                 logger.warning(f"Could not parse start_time '{session_summary.get('start_time')}' to calculate duration for session {session_id}.")
+        except Exception as e:
+            logger.warning(f"Error calculating duration: {e}")
+
+        # Calculate averages from metrics
+        metrics = []
+        try:
+            metric_file = session_dir / 'metrics.jsonl'
+            if metric_file.exists():
+                with open(metric_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            metrics.append(json.loads(line))
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Invalid JSON in metrics: {e}")
+        except Exception as e:
+            logger.error(f"Error reading metrics: {e}")
+
+        # Calculate averages with null handling
+        saccades = [m.get('saccade_velocity_deg_s', 0) for m in metrics if m]
+        fixations = [m.get('fixation_stability_deg', 0) for m in metrics if m]
+        blinks = [m.get('blink_rate_bpm', 0) for m in metrics if m]
+        
+        avg_saccade = sum(saccades)/len(saccades) if saccades else 0
+        avg_fixation = sum(fixations)/len(fixations) if fixations else 0
+        avg_blink = sum(blinks)/len(blinks) if blinks else 0
+
+        # Get genetic risk score
+        genetic_score = None
+        try:
+            genomic_file = session_dir / 'genomic.json'
+            if genomic_file.is_file():
+                with open(genomic_file, 'r', encoding='utf-8') as f:
+                    genomic_data = json.load(f)
+                    final_genetic_score = genomic_data.get('genetic_risk_score')
+                    logger.info(f"Loaded final genetic score for session {session_id}: {final_genetic_score}")
+            else:
+                 logger.warning(f"Genomic file not found for session {session_id}: {genomic_file}")
+        except Exception as e:
+             logger.error(f"Error reading genomic file for session {session_id}: {e}", exc_info=True)
 
 
+        # --- Update SQLite Record ---
         sql = '''UPDATE sessions SET
-                    end_time = ?, duration_seconds = ?, avg_risk_level = ?,
-                    avg_saccade_velocity = ?, avg_fixation_stability = ?, avg_blink_rate = ?,
-                    genetic_risk_score = ?, json_log_filename = ?, notes = ?
+                    end_time = ?, duration_seconds = ?,
+                    final_avg_risk_level = ?, final_avg_saccade_velocity = ?,
+                    final_avg_fixation_stability = ?, final_avg_blink_rate = ?,
+                    final_genetic_risk_score = ?, notes = ?
                  WHERE id = ?'''
 
-        # Extract metrics safely from summary_metrics dict
-        metrics = summary_metrics or {}
+        # Combine notes and error if both exist
+        final_notes = notes or ""
+        if error:
+            final_notes = f"{final_notes}\nERROR: {error}".strip()
+
         params = (
             end_time_iso,
             duration_seconds,
-            metrics.get('avg_risk_level'),
-            metrics.get('avg_saccade_velocity'),
-            metrics.get('avg_fixation_stability'),
-            metrics.get('avg_blink_rate'),
-            metrics.get('genetic_risk_score'),
-            json_log_filename,
-            notes,
+            final_avg_risk if final_avg_risk is not None else 0.0,  # Default to 0.0 if None
+            avg_saccade if avg_saccade is not None else 0.0,
+            avg_fixation if avg_fixation is not None else 0.0,
+            avg_blink if avg_blink is not None else 0.0,
+            genetic_score if genetic_score is not None else 1.0,  # Default genetic score
+            final_notes,
             session_id
         )
+
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            conn.commit()
+            
+            if cursor.rowcount > 0:
+                logger.info(f"Successfully updated session {session_id} with end metrics")
+                return True
+            else:
+                logger.warning(f"No session found with ID {session_id} to update")
+                return False
+                
+        except sqlite3.Error as e:
+            logger.error(f"Database error updating session {session_id}: {e}")
+            if conn: conn.rollback()
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error updating session {session_id}: {e}")
+            return False
         conn = None
         try:
             conn = self._get_connection()
@@ -475,6 +633,113 @@ class StorageManager:
             return False
 
     def load_metric_history(self, metric_name, days_limit=None):
+        """Loads historical metric data for trend analysis"""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            sql = "SELECT * FROM metric_history WHERE metric_name = ?"
+            params = [metric_name]
+            
+            if days_limit:
+                sql += " AND timestamp >= datetime('now', ?)"
+                params.append(f"-{days_limit} days")
+                
+            sql += " ORDER BY timestamp"
+            
+            cursor.execute(sql, params)
+            return [dict(row) for row in cursor.fetchall()]
+            
+        except sqlite3.Error as e:
+            logger.error(f"Error loading metric history: {e}")
+            return []
+
+    def get_session_dir(self, session_id):
+        """Returns Path object for session directory"""
+        session_info = self.get_session_summary(session_id)
+        if not session_info or not session_info.get('session_dir_path'):
+            raise ValueError(f"Invalid session ID or missing directory path: {session_id}")
+        return Path(session_info['session_dir_path'])
+
+    def get_session_details(self, session_id):
+        """Retrieves basic session metadata from database"""
+        sql = "SELECT * FROM sessions WHERE id = ?"
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(sql, (session_id,))
+            result = cursor.fetchone()
+            return dict(result) if result else None
+        except sqlite3.Error as e:
+            logger.error(f"Error getting session details: {e}")
+            return None
+
+    def get_session_data(self, session_id):
+        """Get complete session data from database and JSON files"""
+        session_info = self.get_session_details(session_id)
+        if not session_info:
+            return None
+
+        session_dir = Path(session_info['session_dir_path'])
+        data = {
+            'metadata': dict(session_info),
+            'metrics': [],
+            'genomic': {}
+        }
+
+        # Load metrics from JSONL
+        metrics_file = session_dir / 'metrics.jsonl'
+        if metrics_file.exists():
+            with open(metrics_file, 'r') as f:
+                data['metrics'] = [json.loads(line) for line in f]
+
+        # Load genomic data
+        genomic_file = session_dir / 'genomic.json'
+        if genomic_file.exists():
+            with open(genomic_file, 'r') as f:
+                data['genomic'] = json.load(f)
+
+        return data
+
+    def get_session_data(self, session_id):
+        """Retrieves complete session data from database and JSON files"""
+        try:
+            # Get basic session info from SQLite
+            session_details = self.get_session_details(session_id)
+            if not session_details:
+                return None
+            
+            # Get metrics from JSONL
+            session_dir = self.get_session_dir(session_id)
+            metrics = []
+            metrics_file = session_dir / 'metrics.jsonl'
+            if metrics_file.exists():
+                with open(metrics_file, 'r') as f:
+                    for line in f:
+                        try:
+                            metrics.append(json.loads(line))
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Invalid JSON in metrics file: {e}")
+            
+            # Get genomic results
+            genomic_file = session_dir / 'genomic.json'
+            genomic = {}
+            if genomic_file.exists():
+                with open(genomic_file, 'r') as f:
+                    try:
+                        genomic = json.load(f)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Invalid JSON in genomic file: {e}")
+            
+            return {
+                'metadata': session_details,
+                'metrics': metrics,
+                'genomic': genomic
+            }
+            
+        except Exception as e:
+            logger.error(f"Error loading session data: {e}")
+            return None
         """Loads historical data for a specific metric, optionally limited by days."""
         sql = f"SELECT value, timestamp FROM metric_history WHERE metric_name = ? "
         params = [metric_name]
