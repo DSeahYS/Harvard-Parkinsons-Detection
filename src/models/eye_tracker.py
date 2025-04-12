@@ -496,8 +496,21 @@ class EyeTracker:
         return image
 
     def _draw_simple_overlay(self, image, landmarks):
-        """Draws a simpler overlay based on display_mode ('face' or 'eyes')."""
+        """Draws a simplified overlay showing just the iris positions."""
         if not landmarks: return image
+
+        # Draw iris centers only
+        left_iris = self._get_landmark_pos(landmarks.landmark, self.LEFT_IRIS_CENTER_INDEX,
+                                         self.frame_width, self.frame_height)
+        right_iris = self._get_landmark_pos(landmarks.landmark, self.RIGHT_IRIS_CENTER_INDEX,
+                                          self.frame_width, self.frame_height)
+
+        if left_iris:
+            cv2.circle(image, left_iris, 3, (0, 255, 0), -1)  # Green dot
+        if right_iris:
+            cv2.circle(image, right_iris, 3, (0, 255, 0), -1)  # Green dot
+
+        return image
 
         if self.display_mode == self.DISPLAY_MODE_FACE:
             self.mp_drawing.draw_landmarks(
@@ -524,12 +537,13 @@ class EyeTracker:
 
         return image
 
-    def process_frame(self, frame):
+    def process_frame(self, frame, draw_mesh=True):
         """
         Processes a single video frame.
 
         Args:
             frame (np.ndarray): The input video frame (BGR format).
+            draw_mesh (bool): Whether to draw the detailed face mesh overlay
 
         Returns:
             tuple: (output_frame, metrics, face_landmarks_result)
@@ -539,8 +553,6 @@ class EyeTracker:
         """
         if self.face_mesh is None:
             logging.error("FaceMesh not initialized. Cannot process frame.")
-            # Attempt reinitialization? Or just return error state?
-            # self._init_face_mesh(...) # Consider parameters if re-initializing
             return frame, None, None # Return original frame, no metrics/results
 
         # --- Frame Preparation ---
@@ -551,10 +563,6 @@ class EyeTracker:
         if self.frame_height is None or self.frame_width is None:
             self.frame_height, self.frame_width, _ = frame_rgb.shape
             logging.info(f"Frame dimensions set: {self.frame_width}x{self.frame_height}")
-
-        # --- TODO: Deflectometry Enhancement ---
-        # if self.deflectometry_enhancer:
-        #     frame_rgb = self.deflectometry_enhancer.enhance(frame_rgb)
 
         # --- MediaPipe Processing ---
         frame_rgb.flags.writeable = False # Performance optimization
@@ -577,13 +585,10 @@ class EyeTracker:
             # Calculate metrics
             metrics = self._calculate_metrics(landmarks_list, time.time())
 
-            # --- Drawing ---
-            # Create a temporary drawing frame from the RGB processed frame
-            # drawing_frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-            if self.display_mode == self.DISPLAY_MODE_DEBUG:
+            # Draw overlay based on draw_mesh parameter
+            if draw_mesh:
                 output_frame = self._draw_debug_overlay(output_frame, face_landmarks_proto, metrics)
-            else: # Handle 'face' or 'eyes' modes
+            else:
                 output_frame = self._draw_simple_overlay(output_frame, face_landmarks_proto)
 
         return output_frame, metrics, face_landmarks_proto # Return BGR frame
